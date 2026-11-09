@@ -15,6 +15,11 @@ macro_rules! id {
             pub const fn new(value: [u8; 16]) -> Self {
                 Self(value)
             }
+
+            /// Authority-free identity bytes for adapter correlation/codecs.
+            pub const fn into_bytes(self) -> [u8; 16] {
+                self.0
+            }
         }
 
         impl std::fmt::Debug for $name {
@@ -52,6 +57,16 @@ impl TaskAttemptRefV1 {
             task_incarnation,
             attempt_number,
         }
+    }
+
+    pub const fn task_key(&self) -> [u8; 16] {
+        self.task_key
+    }
+    pub const fn task_incarnation(&self) -> u64 {
+        self.task_incarnation
+    }
+    pub const fn attempt_number(&self) -> u32 {
+        self.attempt_number
     }
 }
 
