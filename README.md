@@ -22,3 +22,8 @@ It invokes no provider, sandbox, model, tool, process, or network service. See
 make check
 ```
 
+## SDK facade
+
+`daimon-sdk-embedded` reexports the provider-neutral harness contracts without
+selecting a provider, process sandbox, model, tool adapter, or runtime policy.
+

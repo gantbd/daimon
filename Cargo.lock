@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "daimon-harness"
 version = "0.0.1"
+
+[[package]]
+name = "daimon-sdk-embedded"
+version = "0.1.0"
+dependencies = [
+ "daimon-harness",
+]

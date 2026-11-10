@@ -12,6 +12,10 @@ path = "src/lib.rs"
 
 [dependencies]
 
+[workspace]
+members = [".", "sdk/embedded"]
+resolver = "3"
+
 [lints.rust]
 unsafe_code = "forbid"
 
