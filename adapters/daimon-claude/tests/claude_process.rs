@@ -71,6 +71,11 @@ fn provider_with_isolation(
             slice_wait: Duration::from_millis(20),
             cancellation_timeout: Duration::from_secs(2),
             close_timeout: Duration::from_secs(2),
+            max_events_per_slice: if matches!(mode, "stream" | "cancel_race") {
+                1
+            } else {
+                ClaudeLimitsV1::default().max_events_per_slice
+            },
             ..ClaudeLimitsV1::default()
         },
         vec![ClaudeLaunchProfileV1 {
@@ -173,26 +178,34 @@ fn exact_launch_and_initialize_stream_bounded_progress_then_terminal_evidence() 
         first.events[0].event,
         AgentEventV1::AssistantMessage { .. }
     ));
+    let mut events = first.events;
+    let mut phase = first.phase;
     thread::sleep(Duration::from_millis(100));
-    let AgentProviderOutcomeV1::Receipt(second) =
-        provider.invoke_agent(&AgentProviderInvocationV1::Advance {
-            session: protocol::AgentSessionIdV1::new([9; 16]),
-            turn: protocol::AgentTurnIdV1::new([12; 16]),
-            idempotency_key: protocol::IdempotencyKeyV1::new([15; 16]),
-            now: 21,
-        })
-    else {
-        panic!("terminal slice expected")
-    };
-    assert_eq!(second.phase, AgentSessionPhaseV1::Ready);
+    for now in 21..24 {
+        let AgentProviderOutcomeV1::Receipt(next) =
+            provider.invoke_agent(&AgentProviderInvocationV1::Advance {
+                session: protocol::AgentSessionIdV1::new([9; 16]),
+                turn: protocol::AgentTurnIdV1::new([12; 16]),
+                idempotency_key: protocol::IdempotencyKeyV1::new([15; 16]),
+                now,
+            })
+        else {
+            panic!("next bounded slice expected")
+        };
+        phase = next.phase;
+        events.extend(next.events);
+        if phase == AgentSessionPhaseV1::Ready {
+            break;
+        }
+    }
+    assert_eq!(phase, AgentSessionPhaseV1::Ready);
     assert!(
-        second
-            .events
+        events
             .iter()
             .any(|record| matches!(record.event, AgentEventV1::Usage { .. }))
     );
     assert!(matches!(
-        second.events.last().unwrap().event,
+        events.last().unwrap().event,
         AgentEventV1::TurnFinished { .. }
     ));
     let AgentProviderOutcomeV1::Receipt(closed) =
