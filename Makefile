@@ -1,6 +1,9 @@
-.PHONY: check check-local-model-config check-peer-profiles check-sdk-boundaries fmt lint test doc qualify-agent-router qualify-agent-router-live qualify-agent-router-live-ensemble qualify-local-agent qualify-chronos-attempt qualify-openai-live qualify-claude-transport qualify-claude-live qualify-gemini-transport qualify-acp-reattach-live qualify-acp-permission-live qualify-acp-tck
+.PHONY: check check-public-source check-local-model-config check-peer-profiles check-sdk-boundaries fmt lint test doc qualify-agent-router qualify-agent-router-live qualify-agent-router-live-ensemble qualify-local-agent qualify-chronos-attempt qualify-openai-live qualify-claude-transport qualify-claude-live qualify-gemini-transport qualify-acp-reattach-live qualify-acp-permission-live qualify-acp-tck
 
-check: check-sdk-boundaries check-local-model-config fmt lint test doc check-peer-profiles
+check: check-public-source check-sdk-boundaries check-local-model-config fmt lint test doc check-peer-profiles
+
+check-public-source:
+	bash scripts/check-public-source.sh
 
 check-local-model-config:
 	cargo run -p daimon-local-model --locked --offline -- --check config/local-model.example.json
