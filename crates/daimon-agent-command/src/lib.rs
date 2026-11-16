@@ -25,6 +25,7 @@ pub const PROMPT_CAPABILITY: &str = "agents.session.prompt.v1";
 pub const PERMISSION_CAPABILITY: &str = "agents.session.permission.v1";
 pub const CANCEL_CAPABILITY: &str = "agents.session.cancel.v1";
 pub const CLOSE_CAPABILITY: &str = "agents.session.close.v1";
+pub const REATTACH_CAPABILITY: &str = "agents.session.reattach.v1";
 pub const CAPABILITY: &str = ADVANCE_CAPABILITY;
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub const MAX_CONTEXT_REFERENCES: usize = 64;
@@ -314,6 +315,16 @@ struct PermissionDocument {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReattachDocument {
+    schema: u8,
+    session: String,
+    expected_revision: u64,
+    now: u64,
+    execution: ExecutionDocument,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecutionDocument {
     execution_id: String,
     task_key: String,
@@ -388,6 +399,27 @@ pub fn parse_permission_document(
         event_cursor: document.event_cursor,
         permission_request: AgentPermissionRequestIdV1::new(id16(&document.permission_request)?),
         option: AgentPermissionOptionIdV1::new(id16(&document.option)?),
+        execution: parse_execution(&document.execution)?,
+        now: document.now,
+    })
+}
+
+/// Parses the strict, credential-free V1 reattach document shared by the
+/// standalone Daimon application and Workbench.
+pub fn parse_reattach_document(document: &[u8]) -> Result<ReattachRequest, PromptDocumentError> {
+    let document: ReattachDocument =
+        serde_json::from_slice(document).map_err(|_| PromptDocumentError::Malformed)?;
+    if document.schema != 1 {
+        return Err(PromptDocumentError::UnsupportedSchema);
+    }
+    if document.execution.context.len() > MAX_CONTEXT_REFERENCES
+        || document.execution.tools.len() > MAX_TOOLS
+    {
+        return Err(PromptDocumentError::Limit);
+    }
+    Ok(ReattachRequest {
+        session: AgentSessionIdV1::new(id16(&document.session)?),
+        expected_revision: document.expected_revision,
         execution: parse_execution(&document.execution)?,
         now: document.now,
     })
@@ -487,6 +519,104 @@ fn digest_permission_challenge(challenge: &AgentPermissionRequestV1) -> [u8; 32]
         digest.update(&option.label);
     }
     digest.finalize().into()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReattachRequest {
+    pub session: AgentSessionIdV1,
+    pub expected_revision: u64,
+    pub execution: ExecuteRequestV1,
+    pub now: u64,
+}
+
+impl ReattachRequest {
+    pub fn execution_digest(&self) -> ContentDigestV1 {
+        ContentDigestV1::new(digest_execution(&self.execution))
+    }
+
+    pub fn confirmation(&self) -> String {
+        format!(
+            "REATTACH DAIMON SESSION {} REVISION {} ENVELOPE {} KEY {} AT {}",
+            hex(&self.session.into_bytes()),
+            self.expected_revision,
+            hex(&self.execution_digest().into_bytes()),
+            hex(&self.execution.idempotency_key.into_bytes()),
+            self.now,
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ReattachError<E> {
+    ConfirmationMismatch { required: String },
+    ObservationTransport(E),
+    ObservationRefused(AgentRefusalV1),
+    InvalidObservation,
+    SessionChanged { actual: AgentSessionViewV1 },
+    MutationTransport(E),
+    MutationRefused(AgentRefusalV1),
+    InvalidMutationReply,
+}
+
+pub fn reattach<P: AgentServicePort>(
+    service_session: SessionHandleV1,
+    port: P,
+    request: ReattachRequest,
+    confirmation: &str,
+) -> Result<AgentOutcomeV1, ReattachError<P::Error>> {
+    let required = request.confirmation();
+    if confirmation != required {
+        return Err(ReattachError::ConfirmationMismatch { required });
+    }
+
+    let mut observer = AgentReadOnlyClient::new(service_session, port);
+    let current = match observer.inspect(request.session) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == request.session =>
+        {
+            view
+        }
+        Ok(AgentReplyV1::Accepted(_)) => return Err(ReattachError::InvalidObservation),
+        Ok(AgentReplyV1::Refused(refusal)) => {
+            return Err(ReattachError::ObservationRefused(refusal));
+        }
+        Err(error) => return Err(ReattachError::ObservationTransport(error)),
+    };
+    if current.revision != request.expected_revision
+        || current.phase != AgentSessionPhaseV1::ReattachRequired
+        || current.active_turn.is_some()
+        || !current.capabilities.resume_session
+    {
+        return Err(ReattachError::SessionChanged { actual: current });
+    }
+
+    let expected_session = request.session;
+    let expected_key = request.execution.idempotency_key;
+    let mut operator = AgentSessionClient::new(service_session, observer.into_port());
+    match operator.reattach(
+        request.session,
+        request.expected_revision,
+        request.execution,
+        request.now,
+    ) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == expected_session =>
+        {
+            Ok(AgentOutcomeV1::Session(view))
+        }
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::OutcomeUnknown {
+            session,
+            idempotency_key,
+        })) if session == expected_session && idempotency_key == expected_key => {
+            Ok(AgentOutcomeV1::OutcomeUnknown {
+                session,
+                idempotency_key,
+            })
+        }
+        Ok(AgentReplyV1::Accepted(_)) => Err(ReattachError::InvalidMutationReply),
+        Ok(AgentReplyV1::Refused(refusal)) => Err(ReattachError::MutationRefused(refusal)),
+        Err(error) => Err(ReattachError::MutationTransport(error)),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -900,6 +1030,15 @@ mod tests {
             expected_revision: request().expected_revision,
             idempotency_key: request().idempotency_key,
             now: request().now,
+        }
+    }
+
+    fn reattach_request() -> ReattachRequest {
+        ReattachRequest {
+            session: prompt_request().session,
+            expected_revision: prompt_request().expected_revision,
+            execution: prompt_request().execution,
+            now: prompt_request().now,
         }
     }
 
@@ -1380,6 +1519,144 @@ mod tests {
             Err(CloseError::MutationTransport("lost"))
         );
         assert_eq!(commands.borrow().len(), 2);
+    }
+
+    #[test]
+    fn exact_confirmation_and_detached_state_attempt_one_reattach() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut detached = view(12, AgentSessionPhaseV1::ReattachRequired);
+        detached.active_turn = None;
+        let mut ready = view(13, AgentSessionPhaseV1::Ready);
+        ready.active_turn = None;
+        assert_eq!(
+            reattach(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(detached))),
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(
+                            ready.clone(),
+                        ))),
+                    ],
+                },
+                reattach_request(),
+                &reattach_request().confirmation(),
+            ),
+            Ok(AgentOutcomeV1::Session(ready))
+        );
+        assert!(matches!(
+            commands.borrow()[0],
+            AgentCommandV1::Inspect { .. }
+        ));
+        let AgentCommandV1::Reattach { execution, .. } = &commands.borrow()[1] else {
+            panic!("reattach command expected");
+        };
+        assert_eq!(execution, &reattach_request().execution);
+        assert_eq!(commands.borrow().len(), 2);
+    }
+
+    #[test]
+    fn reattach_confirmation_and_state_fences_prevent_mutation() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        assert!(matches!(
+            reattach(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![],
+                },
+                reattach_request(),
+                "reattach",
+            ),
+            Err(ReattachError::ConfirmationMismatch { .. })
+        ));
+        assert!(commands.borrow().is_empty());
+
+        let mut ready = view(12, AgentSessionPhaseV1::Ready);
+        ready.active_turn = None;
+        assert!(matches!(
+            reattach(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(ready)))],
+                },
+                reattach_request(),
+                &reattach_request().confirmation(),
+            ),
+            Err(ReattachError::SessionChanged { .. })
+        ));
+        assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn lost_reattach_reply_is_returned_without_retry() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut detached = view(12, AgentSessionPhaseV1::ReattachRequired);
+        detached.active_turn = None;
+        assert_eq!(
+            reattach(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(detached))),
+                        Err("lost"),
+                    ],
+                },
+                reattach_request(),
+                &reattach_request().confirmation(),
+            ),
+            Err(ReattachError::MutationTransport("lost"))
+        );
+        assert_eq!(commands.borrow().len(), 2);
+    }
+
+    #[test]
+    fn reattach_document_is_strict_and_binds_entire_execution_envelope() {
+        let document = br#"{
+            "schema":1,
+            "session":"07070707070707070707070707070707",
+            "expected_revision":12,
+            "now":34,
+            "execution":{
+                "execution_id":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                "task_key":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                "task_incarnation":4,
+                "attempt_number":2,
+                "principal":"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+                "profile":"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+                "idempotency_key":"09090909090909090909090909090909",
+                "context":["0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"],
+                "tools":["0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"],
+                "budget":{
+                    "max_elapsed_millis":1000,
+                    "max_input_tokens":100,
+                    "max_output_tokens":200,
+                    "max_tool_calls":3,
+                    "max_context_bytes":4096,
+                    "max_output_bytes":8192
+                }
+            }
+        }"#;
+        let parsed = parse_reattach_document(document).unwrap();
+        assert_eq!(parsed, reattach_request());
+        assert!(parsed.confirmation().contains(" ENVELOPE "));
+
+        let changed_document = String::from_utf8(document.to_vec())
+            .unwrap()
+            .replace("\"max_output_tokens\":200", "\"max_output_tokens\":201");
+        let changed = parse_reattach_document(changed_document.as_bytes()).unwrap();
+        assert_ne!(parsed.execution_digest(), changed.execution_digest());
+
+        let unknown = String::from_utf8(document.to_vec())
+            .unwrap()
+            .replace("\"schema\":1,", "\"schema\":1,\"extra\":true,");
+        assert_eq!(
+            parse_reattach_document(unknown.as_bytes()),
+            Err(PromptDocumentError::Malformed)
+        );
     }
 
     #[test]

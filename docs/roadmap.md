@@ -137,7 +137,9 @@
   back to `session/new`. Qualify canonical checkpoint/wire behavior, ambiguous
   commits, exact idempotent replay, a hermetic two-process adapter journey, and a
   genuine 2.6.0 restart/resume journey. The guarded genuine-provider gate now
-  passes. An isolated
+  passes. The owner command now additionally fences the exact detached revision
+  and complete fresh execution envelope, requires digest-bound confirmation,
+  attempts once and is shared by standalone and composed operator surfaces. An isolated
   no-prompt run proved Codex removes an empty rollout and the next process fails
   closed, so executing the final gate requires one explicitly authorized bounded
   seed turn before process exit; the authorized gate then proved exact
