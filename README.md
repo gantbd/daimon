@@ -207,10 +207,12 @@ bounded progress observation (including an honest empty still-active slice),
 permission request, or terminal evidence, and leaves
 the service free to accept cancellation while an ACP prompt remains pending.
 `daimon-agent-command` now exposes matching owner-side guards for advance,
-cancel and prompt operator paths. The cancel guard observes the exact active
+cancel, close and prompt operator paths. The cancel guard observes the exact active
 turn and revision, accepts both ordinary active and permission-waiting phases,
 requires an exact confirmation, and attempts the replay-safe attenuation once
-without retrying transport-uncertain delivery. The prompt guard accepts the complete credential-free
+without retrying transport-uncertain delivery. The close guard only accepts an
+exact Ready revision with no active turn, preserving the requirement to cancel
+active work first, and likewise attempts once without retry. The prompt guard accepts the complete credential-free
 execution envelope plus bounded prompt bytes, binds both by digest in an exact
 confirmation, observes the exact ready revision on the mutation connection and
 attempts once. It preserves outcome-unknown evidence and never redispatches a

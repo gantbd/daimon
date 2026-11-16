@@ -24,6 +24,7 @@ pub const ADVANCE_CAPABILITY: &str = "agents.session.advance.v1";
 pub const PROMPT_CAPABILITY: &str = "agents.session.prompt.v1";
 pub const PERMISSION_CAPABILITY: &str = "agents.session.permission.v1";
 pub const CANCEL_CAPABILITY: &str = "agents.session.cancel.v1";
+pub const CLOSE_CAPABILITY: &str = "agents.session.close.v1";
 pub const CAPABILITY: &str = ADVANCE_CAPABILITY;
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub const MAX_CONTEXT_REFERENCES: usize = 64;
@@ -593,6 +594,96 @@ pub fn cancel<P: AgentServicePort>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CloseRequest {
+    pub session: AgentSessionIdV1,
+    pub expected_revision: u64,
+    pub idempotency_key: IdempotencyKeyV1,
+    pub now: u64,
+}
+
+impl CloseRequest {
+    pub fn confirmation(self) -> String {
+        format!(
+            "CLOSE DAIMON SESSION {} REVISION {} KEY {} AT {}",
+            hex(&self.session.into_bytes()),
+            self.expected_revision,
+            hex(&self.idempotency_key.into_bytes()),
+            self.now,
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CloseError<E> {
+    ConfirmationMismatch { required: String },
+    ObservationTransport(E),
+    ObservationRefused(AgentRefusalV1),
+    InvalidObservation,
+    SessionChanged { actual: AgentSessionViewV1 },
+    MutationTransport(E),
+    MutationRefused(AgentRefusalV1),
+    InvalidMutationReply,
+}
+
+pub fn close<P: AgentServicePort>(
+    service_session: SessionHandleV1,
+    port: P,
+    request: CloseRequest,
+    confirmation: &str,
+) -> Result<AgentOutcomeV1, CloseError<P::Error>> {
+    let required = request.confirmation();
+    if confirmation != required {
+        return Err(CloseError::ConfirmationMismatch { required });
+    }
+
+    let mut observer = AgentReadOnlyClient::new(service_session, port);
+    let current = match observer.inspect(request.session) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == request.session =>
+        {
+            view
+        }
+        Ok(AgentReplyV1::Accepted(_)) => return Err(CloseError::InvalidObservation),
+        Ok(AgentReplyV1::Refused(refusal)) => {
+            return Err(CloseError::ObservationRefused(refusal));
+        }
+        Err(error) => return Err(CloseError::ObservationTransport(error)),
+    };
+    if current.revision != request.expected_revision
+        || current.phase != AgentSessionPhaseV1::Ready
+        || current.active_turn.is_some()
+    {
+        return Err(CloseError::SessionChanged { actual: current });
+    }
+
+    let mut operator = AgentSessionClient::new(service_session, observer.into_port());
+    match operator.close(
+        request.session,
+        request.expected_revision,
+        request.idempotency_key,
+        request.now,
+    ) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == request.session =>
+        {
+            Ok(AgentOutcomeV1::Session(view))
+        }
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::OutcomeUnknown {
+            session,
+            idempotency_key,
+        })) if session == request.session && idempotency_key == request.idempotency_key => {
+            Ok(AgentOutcomeV1::OutcomeUnknown {
+                session,
+                idempotency_key,
+            })
+        }
+        Ok(AgentReplyV1::Accepted(_)) => Err(CloseError::InvalidMutationReply),
+        Ok(AgentReplyV1::Refused(refusal)) => Err(CloseError::MutationRefused(refusal)),
+        Err(error) => Err(CloseError::MutationTransport(error)),
+    }
+}
+
 impl AdvanceRequest {
     pub fn confirmation(self) -> String {
         format!(
@@ -797,6 +888,15 @@ mod tests {
         CancelRequest {
             session: request().session,
             turn: request().turn,
+            expected_revision: request().expected_revision,
+            idempotency_key: request().idempotency_key,
+            now: request().now,
+        }
+    }
+
+    fn close_request() -> CloseRequest {
+        CloseRequest {
+            session: request().session,
             expected_revision: request().expected_revision,
             idempotency_key: request().idempotency_key,
             now: request().now,
@@ -1188,6 +1288,96 @@ mod tests {
                 &cancel_request().confirmation(),
             ),
             Err(CancelError::MutationTransport("lost"))
+        );
+        assert_eq!(commands.borrow().len(), 2);
+    }
+
+    #[test]
+    fn exact_confirmation_and_ready_state_attempt_one_close() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut ready = view(12, AgentSessionPhaseV1::Ready);
+        ready.active_turn = None;
+        let mut closed = view(13, AgentSessionPhaseV1::Closed);
+        closed.active_turn = None;
+        assert_eq!(
+            close(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(ready))),
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(
+                            closed.clone(),
+                        ))),
+                    ],
+                },
+                close_request(),
+                &close_request().confirmation(),
+            ),
+            Ok(AgentOutcomeV1::Session(closed))
+        );
+        assert!(matches!(
+            commands.borrow()[0],
+            AgentCommandV1::Inspect { .. }
+        ));
+        assert!(matches!(commands.borrow()[1], AgentCommandV1::Close { .. }));
+        assert_eq!(commands.borrow().len(), 2);
+    }
+
+    #[test]
+    fn close_confirmation_and_active_state_fences_prevent_mutation() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        assert!(matches!(
+            close(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![],
+                },
+                close_request(),
+                "close",
+            ),
+            Err(CloseError::ConfirmationMismatch { .. })
+        ));
+        assert!(commands.borrow().is_empty());
+
+        assert!(matches!(
+            close(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view(
+                        12,
+                        AgentSessionPhaseV1::TurnActive,
+                    ))))],
+                },
+                close_request(),
+                &close_request().confirmation(),
+            ),
+            Err(CloseError::SessionChanged { .. })
+        ));
+        assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn lost_close_reply_is_returned_without_retry() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut ready = view(12, AgentSessionPhaseV1::Ready);
+        ready.active_turn = None;
+        assert_eq!(
+            close(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(ready))),
+                        Err("lost"),
+                    ],
+                },
+                close_request(),
+                &close_request().confirmation(),
+            ),
+            Err(CloseError::MutationTransport("lost"))
         );
         assert_eq!(commands.borrow().len(), 2);
     }

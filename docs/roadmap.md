@@ -210,5 +210,7 @@
   envelope by digest; permission confirmation additionally binds the complete
   cursor-identified provider challenge. Cancel accepts both turn-active and
   permission-waiting state and preserves uncertain delivery without retry.
-  Close, reattach and native-host slices retain this phase's requirements.
+  Close now separately fences an exact Ready revision with no active turn and
+  preserves uncertain delivery without retry. Reattach and native-host slices
+  retain this phase's requirements.
 
