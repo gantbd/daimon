@@ -206,6 +206,13 @@ fenced `Advance` mutation. It grants no new execution authority, admits only a
 bounded progress observation (including an honest empty still-active slice),
 permission request, or terminal evidence, and leaves
 the service free to accept cancellation while an ACP prompt remains pending.
+`daimon-agent-command` now exposes matching owner-side guards for advance and
+prompt operator paths. The prompt guard accepts the complete credential-free
+execution envelope plus bounded prompt bytes, binds both by digest in an exact
+confirmation, observes the exact ready revision on the mutation connection and
+attempts once. It preserves outcome-unknown evidence and never redispatches a
+transport-uncertain prompt. Standalone and composed shells consume the same
+strict request document without moving authority into presentation code.
 
 `daimon-aegis` implements the execution-authority port through Aegis's public,
 session-bound client. It requires current `Daimon/Execute` decisions for the

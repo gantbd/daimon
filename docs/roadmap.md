@@ -204,4 +204,9 @@
 - Qualify standalone interactive/headless and Workbench interactive/headless
   paths with identical authorization, no-redispatch, cancellation, and
   outcome-unknown behavior.
+- The first mutation slices now reuse Daimon-owned exact-state guards:
+  active-turn advance and prompt dispatch. Prompt confirmation binds raw content
+  and the complete credential-free execution envelope by digest; remaining
+  permission, cancel, close, reattach and native-host slices retain this phase's
+  requirements.
 

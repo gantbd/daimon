@@ -10,6 +10,9 @@ description = "Daimon-owned exact-state guards for interactive agent operations"
 [dependencies]
 daimon-client = { version = "=0.1.0", path = "../daimon-client" }
 daimon-protocol = { version = "=0.1.0", path = "../daimon-protocol" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
 
 [lints.rust]
 unsafe_code = "forbid"
