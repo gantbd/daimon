@@ -11,7 +11,12 @@ An additional 2026-11-16 run explicitly pinned the installed `sonnet` alias.
 That run produced no terminal result within the declared 120-second session
 budget, so the gate exhausted its independent polling fuel and failed without
 claiming completion. The explicit model pin therefore demonstrates a second
-honest failure mode rather than overwriting the earlier terminal evidence.
+honest failure mode rather than overwriting the earlier terminal evidence. A
+later captured retry against the same 2.1.311 executable failed closed in 3.42
+seconds. Its provider state records `authentication_failed` because the OAuth
+session expired and could not be refreshed, and `claude auth status` reports
+`loggedIn: false`. This is an external login prerequisite, not completion
+evidence or a reason to relax Daimon's terminal contract.
 
 Claude Code's Agent SDK uses a long-lived bidirectional NDJSON/control channel.
 It is represented by `AgentWireProfileV1::ClaudeAgentStreamJson` and the
@@ -82,7 +87,9 @@ neither change relaxes the required completed terminal event.
 The later explicit-`sonnet` run stayed active through that full bound and
 returned no terminal result. It likewise remains a failed qualification: a
 model alias, assistant text, or elapsed polling fuel cannot substitute for the
-provider's terminal envelope.
+provider's terminal envelope. The subsequent expired-session attempt is
+retained as a reviewed normalized shell capture at
+[`evidence/claude-2.1.311-live-2026-11-16.txt`](evidence/claude-2.1.311-live-2026-11-16.txt).
 Hermetic process qualification now additionally proves that provider exit after
 prompt dispatch becomes outcome-unknown and an `Advance` cannot relaunch it.
 Stale permission request and option identities are refused without consuming
@@ -103,7 +110,13 @@ ensemble. The credential-free mixed-transport fixture gate is
 `make qualify-agent-router`. Its opt-in live peer passed on 2026-11-16 against
 installed `codex-acp` 1.8.0 and Claude Code 2.1.311, opening and closing both
 real sessions concurrently through one profile-selected provider-neutral router
-without submitting a model prompt.
+without submitting a model prompt. `make qualify-agent-router-live-ensemble`
+is the separate two-turn gate: it runs Claude first, so an unavailable Claude
+login cannot consume a Codex turn, then requires one completed no-tool response
+from each provider with distinct profile evidence and exact persona markers.
+Its captured first run failed at Claude's required completed disposition and
+sent no Codex prompt; the reviewed evidence is
+[`evidence/codex-claude-mixed-live-2026-11-16.txt`](evidence/codex-claude-mixed-live-2026-11-16.txt).
 
 Primary protocol references:
 

@@ -1,0 +1,34 @@
+Codex ACP 2.6.0 + Claude Code 2.1.311 live mixed-provider attempt
+Captured: 2026-11-16 (America/New_York)
+Codex package integrity: sha512-/PBsd0H6URy4bhXhAeXqwb7RqctbXfNceRihAh6nDmn5HJ873uzoHvHxF45YmeWfgOKKRrNRLZjYsket2a7EsQ==
+Authentication boundary: existing Codex and Claude sessions; no API key or
+  credential value was captured.
+Spend boundary: at most one fixed no-tool turn per provider. Claude is evaluated
+  first; this attempt failed at Claude's terminal disposition and sent no Codex
+  model prompt.
+
+$ DAIMON_ROUTER_ENABLE_PROMPTS=1 \
+  DAIMON_ROUTER_ACP_PROGRAM=/private/tmp/daimon-mixed-codex-acp-2.6.0/node_modules/.bin/codex-acp \
+  DAIMON_ROUTER_ACP_ENV='HOME PATH CODEX_HOME INITIAL_AGENT_MODE' \
+  DAIMON_ROUTER_CLAUDE_PROGRAM=/opt/homebrew/bin/claude \
+  make qualify-agent-router-live-ensemble
+DAIMON_ROUTER_ENABLE_PROMPTS=1 DAIMON_ROUTER_ACP_PROGRAM='/private/tmp/daimon-mixed-codex-acp-2.6.0/node_modules/.bin/codex-acp' DAIMON_ROUTER_ACP_ARGS='' DAIMON_ROUTER_ACP_ENV='HOME PATH CODEX_HOME INITIAL_AGENT_MODE' DAIMON_ROUTER_ACP_AUTH_METHOD='' DAIMON_ROUTER_CLAUDE_PROGRAM='/opt/homebrew/bin/claude' DAIMON_ROUTER_CLAUDE_ARGS='' DAIMON_ROUTER_CLAUDE_ENV='' cargo test -p daimon-agent-router --test live_provider_router genuine_acp_and_claude_complete_distinct_no_tool_turns_through_router --locked --offline -- --ignored --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/live_provider_router.rs (target/debug/deps/live_provider_router-e682dd320ae833a9)
+
+running 1 test
+assertion failed: required completed TurnFinished event was absent
+test genuine_acp_and_claude_complete_distinct_no_tool_turns_through_router ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 12.07s
+make: *** [qualify-agent-router-live-ensemble] Error 101
+
+Correlated provider diagnosis from the immediately preceding standalone Claude
+gate: `authentication_failed`; the OAuth session expired and could not be
+refreshed. `claude auth status` reported `loggedIn: false`.
+
+Recorder exit status: 2
+Review: the 1,621-byte raw BSD script capture was scanned for authorization,
+  token, API-key, bearer, and sk-* material. No match was present. The raw
+  capture and disposable Codex bridge/home were then removed. This is bounded
+  failure evidence, not a qualified live ensemble.

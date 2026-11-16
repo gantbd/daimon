@@ -1,4 +1,4 @@
-.PHONY: check check-local-model-config check-peer-profiles check-sdk-boundaries fmt lint test doc qualify-agent-router qualify-agent-router-live qualify-local-agent qualify-chronos-attempt qualify-openai-live qualify-claude-transport qualify-claude-live qualify-gemini-transport qualify-acp-reattach-live qualify-acp-permission-live qualify-acp-tck
+.PHONY: check check-local-model-config check-peer-profiles check-sdk-boundaries fmt lint test doc qualify-agent-router qualify-agent-router-live qualify-agent-router-live-ensemble qualify-local-agent qualify-chronos-attempt qualify-openai-live qualify-claude-transport qualify-claude-live qualify-gemini-transport qualify-acp-reattach-live qualify-acp-permission-live qualify-acp-tck
 
 check: check-sdk-boundaries check-local-model-config fmt lint test doc check-peer-profiles
 
@@ -39,6 +39,12 @@ qualify-agent-router-live:
 	@test -n "$(DAIMON_ROUTER_ACP_PROGRAM)" || (echo 'DAIMON_ROUTER_ACP_PROGRAM is required' >&2; exit 2)
 	@test -n "$(DAIMON_ROUTER_CLAUDE_PROGRAM)" || (echo 'DAIMON_ROUTER_CLAUDE_PROGRAM is required' >&2; exit 2)
 	DAIMON_ROUTER_ACP_PROGRAM='$(DAIMON_ROUTER_ACP_PROGRAM)' DAIMON_ROUTER_ACP_ARGS='$(DAIMON_ROUTER_ACP_ARGS)' DAIMON_ROUTER_ACP_ENV='$(DAIMON_ROUTER_ACP_ENV)' DAIMON_ROUTER_ACP_AUTH_METHOD='$(DAIMON_ROUTER_ACP_AUTH_METHOD)' DAIMON_ROUTER_CLAUDE_PROGRAM='$(DAIMON_ROUTER_CLAUDE_PROGRAM)' DAIMON_ROUTER_CLAUDE_ARGS='$(DAIMON_ROUTER_CLAUDE_ARGS)' DAIMON_ROUTER_CLAUDE_ENV='$(DAIMON_ROUTER_CLAUDE_ENV)' cargo test -p daimon-agent-router --test live_provider_router genuine_acp_and_claude_sessions_share_one_provider_neutral_router --locked --offline -- --ignored --exact --nocapture
+
+qualify-agent-router-live-ensemble:
+	@test "$(DAIMON_ROUTER_ENABLE_PROMPTS)" = "1" || (echo 'DAIMON_ROUTER_ENABLE_PROMPTS=1 is required to authorize one turn per provider' >&2; exit 2)
+	@test -x "$(DAIMON_ROUTER_ACP_PROGRAM)" || (echo 'DAIMON_ROUTER_ACP_PROGRAM must name an executable ACP agent' >&2; exit 2)
+	@test -x "$(DAIMON_ROUTER_CLAUDE_PROGRAM)" || (echo 'DAIMON_ROUTER_CLAUDE_PROGRAM must name an executable Claude command' >&2; exit 2)
+	DAIMON_ROUTER_ENABLE_PROMPTS=1 DAIMON_ROUTER_ACP_PROGRAM='$(DAIMON_ROUTER_ACP_PROGRAM)' DAIMON_ROUTER_ACP_ARGS='$(DAIMON_ROUTER_ACP_ARGS)' DAIMON_ROUTER_ACP_ENV='$(DAIMON_ROUTER_ACP_ENV)' DAIMON_ROUTER_ACP_AUTH_METHOD='$(DAIMON_ROUTER_ACP_AUTH_METHOD)' DAIMON_ROUTER_CLAUDE_PROGRAM='$(DAIMON_ROUTER_CLAUDE_PROGRAM)' DAIMON_ROUTER_CLAUDE_ARGS='$(DAIMON_ROUTER_CLAUDE_ARGS)' DAIMON_ROUTER_CLAUDE_ENV='$(DAIMON_ROUTER_CLAUDE_ENV)' cargo test -p daimon-agent-router --test live_provider_router genuine_acp_and_claude_complete_distinct_no_tool_turns_through_router --locked --offline -- --ignored --exact --nocapture
 
 qualify-local-agent:
 	cargo fmt -p daimon-local-agent -- --check

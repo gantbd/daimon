@@ -1,0 +1,39 @@
+Claude Code 2.1.311 bounded live-turn qualification attempt
+Captured: 2026-11-16 (America/New_York)
+Executable: /opt/homebrew/bin/claude -> Claude Code 2.1.311
+Authentication boundary: existing Claude Code first-party session; no API key
+  or credential value was captured.
+Spend boundary: one fixed no-tool turn requesting MOIRA_CLAUDE_OK.
+
+$ DAIMON_CLAUDE_ENABLE_PROMPT=1 \
+  DAIMON_CLAUDE_PROGRAM=/opt/homebrew/bin/claude \
+  make qualify-claude-live
+DAIMON_CLAUDE_ENABLE_PROMPT=1 DAIMON_CLAUDE_PROGRAM='/opt/homebrew/bin/claude' DAIMON_CLAUDE_ARGS='' cargo test -p daimon-claude --test live_provider genuine_claude_completes_one_no_tool_prompt --locked --offline -- --ignored --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.75s
+     Running tests/live_provider.rs (target/debug/deps/live_provider-bf379270900def85)
+
+running 1 test
+assertion `left == right` failed: Claude did not return a completed terminal disposition
+  left: Some(Failed)
+ right: Some(Completed)
+test genuine_claude_completes_one_no_tool_prompt ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 3.42s
+make: *** [qualify-claude-live] Error 101
+
+Provider-state diagnosis, selected without prompt or user content:
+  error: authentication_failed
+  text: Failed to authenticate: OAuth session expired and could not be refreshed
+
+$ /opt/homebrew/bin/claude auth status
+{
+  "loggedIn": false,
+  "authMethod": "none",
+  "apiProvider": "firstParty"
+}
+
+Recorder exit status: 2
+Review: the 1,244-byte raw BSD script capture was scanned for authorization,
+  token, API-key, bearer, and sk-* material. No match was present. The raw
+  capture was then removed. This is failure evidence, not live-turn
+  qualification.

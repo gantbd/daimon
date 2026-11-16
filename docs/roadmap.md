@@ -103,7 +103,9 @@
   received assistant output, but failed closed because its terminal envelope
   combined a `success` subtype with `is_error=true`; a completed live turn
   remains open. A second run explicitly pinned `sonnet` but returned no terminal
-  envelope within the full 120-second bound; it also remained unqualified.
+  envelope within the full 120-second bound. A captured retry then failed with
+  `authentication_failed`; `claude auth status` confirms the retained OAuth
+  session is logged out. The adapter continues to fail closed.
 - [Implemented and executed; remains opt-in] Run the upstream experimental ACP
   agent TCK only through an explicit model-spend target using a separately pinned
   executable, scratch workspace and retained JSON report. The 2026-11-16 v0.3.0
@@ -148,11 +150,15 @@
   not disguise that entitlement rejection as a protocol workaround; a
   separately and explicitly selected API-key or enterprise credential lane
   remains to be qualified.
-- [Live mixed transport qualified] `make qualify-agent-router-live` opens real
+- [Live mixed transport qualified; prompt ensemble implemented and login-blocked]
+  `make qualify-agent-router-live` opens real
   installed Codex ACP and Claude stream-JSON sessions through one bounded router,
   verifies exact frozen-profile attribution, and closes each through its retained
-  route. The 2026-11-16 run passed without a model prompt; a mixed-provider
-  prompt ensemble remains open.
+  route. The 2026-11-16 run passed without a model prompt. The separately gated
+  `qualify-agent-router-live-ensemble` runs Claude first and then Codex, permits
+  one no-tool turn each, requires completed dispositions, rejects permission or
+  effect events, and verifies distinct frozen profile evidence plus persona
+  markers. Execution remains open until Claude is logged in again.
 - [Implemented production read callback] Keep ACP client filesystem access
   attenuated by default and advertise reads only for an exact configured
   workspace scope and tool capability. The local-agent governor carries prompt/

@@ -169,7 +169,10 @@ terminal close without provider fallthrough. The opt-in
 `qualify-agent-router-live` gate also passed against installed `codex-acp` 1.8.0
 and Claude Code 2.1.311: both real sessions opened concurrently with exact
 profile attribution and closed through their retained routes without submitting
-a model prompt.
+a model prompt. The distinct `qualify-agent-router-live-ensemble` gate permits
+one no-tool historian turn and one no-tool rigor-reviewer turn, requires exact
+completed evidence from both, and runs Claude first so an unavailable Claude
+login cannot consume a Codex turn.
 `daimon-local-agent` is the matching production application composition. Its
 strict configuration derives launch digests from exact program, argv and
 inherited-environment names, assembles bounded digest-verified context, connects
