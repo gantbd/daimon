@@ -213,6 +213,10 @@ confirmation, observes the exact ready revision on the mutation connection and
 attempts once. It preserves outcome-unknown evidence and never redispatches a
 transport-uncertain prompt. Standalone and composed shells consume the same
 strict request document without moving authority into presentation code.
+The same crate's permission guard observes the exact awaiting-permission
+revision and cursor-identified challenge, binds its complete provider text and
+options by digest together with the separately authorized execution envelope,
+and attempts one exact request/option decision without retry.
 
 `daimon-aegis` implements the execution-authority port through Aegis's public,
 session-bound client. It requires current `Daimon/Execute` decisions for the
