@@ -1,0 +1,17 @@
+[package]
+name = "daimon-host"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Trusted outbound ports for composing Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-protocol = { path = "../daimon-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

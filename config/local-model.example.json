@@ -1,0 +1,48 @@
+{
+  "principal": "01010101010101010101010101010101",
+  "aegis_socket": "/private/tmp/aegis.sock",
+  "aegis_expected_epoch": 0,
+  "aegis_grant_now": 1,
+  "aegis_grant_expires_at": 1000000,
+  "chronos_socket": "/private/tmp/chronos.sock",
+  "daimon_socket": "/private/tmp/daimon-model.sock",
+  "store_directory": "/private/tmp/daimon-model-store",
+  "provider": {
+    "provider_id": "02020202020202020202020202020202",
+    "harness_profile_id": "03030303030303030303030303030303",
+    "model": "local-model",
+    "address": "127.0.0.1:11434",
+    "host_header": "127.0.0.1:11434",
+    "path": "/v1/chat/completions",
+    "structured_output": true,
+    "structured_tools": false,
+    "sampling_temperature_milli": 0,
+    "connect_timeout_ms": 2000,
+    "io_timeout_ms": 5000,
+    "max_request_bytes": 4194304,
+    "max_response_bytes": 8388608
+  },
+  "task_bindings": [
+    {
+      "external_task_key": "04040404040404040404040404040404",
+      "chronos_task_id": "local-model-task"
+    }
+  ],
+  "tool_capabilities": [],
+  "context": [
+    {
+      "reference": "05050505050505050505050505050505",
+      "kind": "agora_message",
+      "text": "Replace this example with composition-owned context."
+    }
+  ],
+  "messages": [
+    {
+      "role": "system",
+      "content": "Return only proposals supported by the supplied evidence."
+    }
+  ],
+  "io_timeout_ms": 5000,
+  "max_executions": 1024,
+  "max_requests_per_connection": 64
+}

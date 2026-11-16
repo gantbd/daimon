@@ -1,0 +1,28 @@
+[package]
+name = "daimon-aegis"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Public-client Aegis execution authorizer for Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+aegis-client = { path = "../../../aegis/crates/aegis-client" }
+aegis-protocol = { path = "../../../aegis/crates/aegis-protocol" }
+daimon-host = { path = "../../crates/daimon-host" }
+daimon-protocol = { path = "../../crates/daimon-protocol" }
+
+[dev-dependencies]
+aegis-authority = { path = "../../../aegis" }
+aegis-host = { path = "../../../aegis/host/aegis-host" }
+aegis-service = { path = "../../../aegis/crates/aegis-service" }
+daimon-harness = { path = "../.." }
+daimon-service = { path = "../../crates/daimon-service" }
+keystone-storage = { path = "../../../keystone/crates/keystone-storage" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

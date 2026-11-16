@@ -1,0 +1,29 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "daimon-qualification-chronos-attempt"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Real Chronos service exact-attempt qualification for Daimon"
+
+[dependencies]
+chronos-adapter-native = { path = "../../../chronos/adapters/native" }
+chronos-engine = { path = "../../../chronos/engine/chronos-engine" }
+chronos-host = { path = "../../../chronos/host/chronos-host" }
+chronos-protocol = { path = "../../../chronos/protocol/chronos-protocol" }
+chronos-service = { path = "../../../chronos/service/chronos-service" }
+chronos-wire = { path = "../../../chronos/protocol/chronos-wire" }
+daimon-chronos = { path = "../../adapters/daimon-chronos" }
+daimon-host = { path = "../../crates/daimon-host" }
+daimon-protocol = { path = "../../crates/daimon-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

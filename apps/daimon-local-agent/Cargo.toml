@@ -1,0 +1,46 @@
+[package]
+name = "daimon-local-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Composition-only local interactive-agent daemon for Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+aegis-client = { path = "../../../aegis/crates/aegis-client" }
+aegis-local-daemon = { path = "../../../aegis/crates/aegis-local-daemon" }
+aegis-protocol = { path = "../../../aegis/crates/aegis-protocol" }
+aegis-wire = { path = "../../../aegis/crates/aegis-wire" }
+chronos-client = { path = "../../../chronos/client/chronos-client" }
+chronos-protocol = { path = "../../../chronos/protocol/chronos-protocol" }
+chronos-wire = { path = "../../../chronos/protocol/chronos-wire" }
+daimon-acp = { path = "../../adapters/daimon-acp" }
+daimon-aegis = { path = "../../adapters/daimon-aegis" }
+daimon-agent-router = { path = "../../adapters/daimon-agent-router" }
+daimon-checkpoint = { path = "../../adapters/daimon-checkpoint" }
+daimon-chronos = { path = "../../adapters/daimon-chronos" }
+daimon-claude = { path = "../../adapters/daimon-claude" }
+daimon-harness = { path = "../.." }
+daimon-host = { path = "../../crates/daimon-host" }
+daimon-local = { path = "../../adapters/daimon-local" }
+daimon-local-daemon = { path = "../../crates/daimon-local-daemon" }
+daimon-process = { path = "../../crates/daimon-process" }
+daimon-protocol = { path = "../../crates/daimon-protocol" }
+daimon-service = { path = "../../crates/daimon-service" }
+daimon-wire = { path = "../../crates/daimon-wire" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+aegis-authority = { path = "../../../aegis" }
+aegis-local = { path = "../../../aegis/adapters/aegis-local" }
+aegis-service = { path = "../../../aegis/crates/aegis-service" }
+daimon-client = { path = "../../crates/daimon-client", features = ["unix"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

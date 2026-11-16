@@ -1,0 +1,17 @@
+[package]
+name = "daimon-wire"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Canonical bounded V1 wire codec for Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-protocol = { path = "../daimon-protocol" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

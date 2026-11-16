@@ -1,0 +1,20 @@
+[package]
+name = "daimon-checkpoint"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Canonical bounded durable service checkpoint adapter for Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-host = { path = "../../crates/daimon-host" }
+daimon-protocol = { path = "../../crates/daimon-protocol" }
+keystone-codec = { path = "../../../keystone/crates/keystone-codec" }
+keystone-storage = { path = "../../../keystone/crates/keystone-storage" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

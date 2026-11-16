@@ -1,0 +1,12 @@
+/Users/brian/Workspace/github.com/gantbd/daimon/qualification/chronos-attempt/target/debug/deps/serde-33d7ec41cd18bbd5.d: /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/brian/Workspace/github.com/gantbd/daimon/qualification/chronos-attempt/target/debug/build/serde-96533ca132bdbf45/out/private.rs
+
+/Users/brian/Workspace/github.com/gantbd/daimon/qualification/chronos-attempt/target/debug/deps/libserde-33d7ec41cd18bbd5.rmeta: /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/brian/Workspace/github.com/gantbd/daimon/qualification/chronos-attempt/target/debug/build/serde-96533ca132bdbf45/out/private.rs
+
+/Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/brian/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/brian/Workspace/github.com/gantbd/daimon/qualification/chronos-attempt/target/debug/build/serde-96533ca132bdbf45/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/brian/Workspace/github.com/gantbd/daimon/qualification/chronos-attempt/target/debug/build/serde-96533ca132bdbf45/out

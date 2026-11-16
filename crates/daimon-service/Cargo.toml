@@ -1,0 +1,20 @@
+[package]
+name = "daimon-service"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Native Daimon execution application service"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-harness = { path = "../.." }
+daimon-host = { path = "../daimon-host" }
+daimon-protocol = { path = "../daimon-protocol" }
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

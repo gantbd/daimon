@@ -1,0 +1,24 @@
+[package]
+name = "daimon-local"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Exclusive local directory service-state adapter for Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-checkpoint = { path = "../daimon-checkpoint" }
+keystone-storage-directory = { path = "../../../keystone/crates/keystone-storage-directory" }
+
+[dev-dependencies]
+daimon-harness = { path = "../.." }
+daimon-host = { path = "../../crates/daimon-host" }
+daimon-protocol = { path = "../../crates/daimon-protocol" }
+daimon-service = { path = "../../crates/daimon-service" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

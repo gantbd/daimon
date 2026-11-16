@@ -1,0 +1,26 @@
+[package]
+name = "daimon-local-daemon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Bounded authenticated private Unix daemon for Daimon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-client = { path = "../daimon-client", features = ["unix"] }
+daimon-host = { path = "../daimon-host" }
+daimon-protocol = { path = "../daimon-protocol" }
+daimon-service = { path = "../daimon-service" }
+daimon-wire = { path = "../daimon-wire" }
+
+[dev-dependencies]
+daimon-checkpoint = { path = "../../adapters/daimon-checkpoint" }
+daimon-harness = { path = "../.." }
+daimon-local = { path = "../../adapters/daimon-local" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

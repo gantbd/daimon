@@ -1,0 +1,22 @@
+[package]
+name = "daimon-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Capability-shaped transport-neutral Daimon clients"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+unix = ["dep:daimon-wire"]
+
+[dependencies]
+daimon-protocol = { path = "../daimon-protocol" }
+
+daimon-wire = { path = "../daimon-wire", optional = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

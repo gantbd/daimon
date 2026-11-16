@@ -1,0 +1,77 @@
+{
+  "principal": "01010101010101010101010101010101",
+  "aegis_socket": "/tmp/aegis.sock",
+  "aegis_expected_epoch": 0,
+  "aegis_grant_now": 1,
+  "aegis_grant_expires_at": 1000000,
+  "chronos_socket": "/tmp/chronos.sock",
+  "daimon_socket": "/tmp/daimon-agent.sock",
+  "store_directory": "/tmp/daimon-agent-store",
+  "providers": [
+    {
+      "provider_id": "02020202020202020202020202020202",
+      "harness_profile_id": "03030303030303030303030303030303",
+      "policy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "program": "/usr/local/bin/codex-acp",
+      "arguments": [],
+      "inherited_environment_names": ["CODEX_HOME"],
+      "acp_agent_authentication_method": null,
+      "transport": "acp"
+    },
+    {
+      "provider_id": "09090909090909090909090909090909",
+      "harness_profile_id": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "policy_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "program": "/usr/local/bin/gemini",
+      "arguments": ["--acp"],
+      "inherited_environment_names": [
+        "HOME",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION"
+      ],
+      "transport": "acp"
+    },
+    {
+      "provider_id": "04040404040404040404040404040404",
+      "harness_profile_id": "05050505050505050505050505050505",
+      "policy_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "program": "/usr/local/bin/claude",
+      "arguments": [],
+      "inherited_environment_names": ["HOME"],
+      "transport": "claude_stream_json"
+    }
+  ],
+  "workspaces": [
+    {
+      "identity": "06060606060606060606060606060606",
+      "path": "/tmp"
+    }
+  ],
+  "task_bindings": [
+    {
+      "external_task_key": "07070707070707070707070707070707",
+      "chronos_task_id": "local-agent-task"
+    }
+  ],
+  "tool_capabilities": [],
+  "context": [
+    {
+      "reference": "08080808080808080808080808080808",
+      "kind": "chronos_work",
+      "text": "Replace this example with composition-owned exact context.",
+      "grounding": {
+        "depth": "activated",
+        "grounding_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "surface_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+      }
+    }
+  ],
+  "io_timeout_ms": 5000,
+  "max_agent_sessions": 1024,
+  "max_service_sessions": 256,
+  "max_requests_per_connection": 64,
+  "max_store_bytes": 67108864,
+  "max_context_bytes": 8388608
+}

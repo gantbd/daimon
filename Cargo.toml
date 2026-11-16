@@ -13,7 +13,30 @@ path = "src/lib.rs"
 [dependencies]
 
 [workspace]
-members = [".", "sdk/embedded"]
+exclude = ["qualification/chronos-attempt"]
+members = [
+  ".",
+  "apps/daimon-local-agent",
+  "apps/daimon-local-model",
+  "apps/daimon-process-boundary",
+  "adapters/daimon-aegis",
+  "adapters/daimon-agent-router",
+  "adapters/daimon-acp",
+  "adapters/daimon-checkpoint",
+  "adapters/daimon-claude",
+  "adapters/daimon-chronos",
+  "adapters/daimon-dendrite",
+  "adapters/daimon-local",
+  "adapters/daimon-openai-local",
+  "crates/daimon-client",
+  "crates/daimon-host",
+  "crates/daimon-local-daemon",
+  "crates/daimon-process",
+  "crates/daimon-protocol",
+  "crates/daimon-service",
+  "crates/daimon-wire",
+  "sdk/embedded",
+]
 resolver = "3"
 
 [lints.rust]

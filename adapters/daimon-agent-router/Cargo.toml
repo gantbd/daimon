@@ -1,0 +1,23 @@
+[package]
+name = "daimon-agent-router"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+description = "Bounded provider-neutral routing for Daimon interactive agent sessions"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+daimon-host = { path = "../../crates/daimon-host" }
+daimon-protocol = { path = "../../crates/daimon-protocol" }
+
+[dev-dependencies]
+daimon-acp = { path = "../daimon-acp" }
+daimon-claude = { path = "../daimon-claude" }
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
