@@ -1,0 +1,32 @@
+Codex ACP 2.6.0 genuine restart/reattach qualification
+Captured: 2026-11-16 (America/New_York)
+Package: @agentclientprotocol/codex-acp 2.6.0
+Registry integrity: sha512-/PBsd0H6URy4bhXhAeXqwb7RqctbXfNceRihAh6nDmn5HJ873uzoHvHxF45YmeWfgOKKRrNRLZjYsket2a7EsQ==
+Authentication boundary: existing Codex auth session exposed to a disposable
+  CODEX_HOME by auth-file symlink; no API key or credential value was captured.
+Spend boundary: one fixed no-tool seed turn requesting
+  DAIMON_REATTACH_SEED_OK.
+
+The named test asserts that the first provider process is dropped after the
+seed turn, a fresh provider process performs explicit session/resume, the
+canonical session returns Ready with the same recovery locator, and no prior
+events are replayed. It refuses to run without both explicit opt-in variables.
+
+$ DAIMON_ACP_ENABLE_REATTACH=1 \
+  DAIMON_ACP_ENABLE_REATTACH_PROMPT=1 \
+  DAIMON_ACP_PROGRAM=/private/tmp/daimon-codex-acp-2.6.0/node_modules/.bin/codex-acp \
+  DAIMON_ACP_ENV='HOME PATH CODEX_HOME INITIAL_AGENT_MODE' \
+  make qualify-acp-reattach-live
+DAIMON_ACP_ENABLE_REATTACH=1 DAIMON_ACP_ENABLE_REATTACH_PROMPT=1 DAIMON_ACP_PROGRAM='/private/tmp/daimon-codex-acp-2.6.0/node_modules/.bin/codex-acp' DAIMON_ACP_ARGS='' DAIMON_ACP_ENV='HOME PATH CODEX_HOME INITIAL_AGENT_MODE' DAIMON_ACP_AUTH_METHOD='' cargo test -p daimon-acp --test live_provider genuine_provider_reattaches_idle_session_without_history_replay --locked --offline -- --ignored --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/live_provider.rs (target/debug/deps/live_provider-d6514106f2828eef)
+
+running 1 test
+test genuine_provider_reattaches_idle_session_without_history_replay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 23.09s
+
+Recorder exit status: 0
+Review: the 776-byte raw BSD script capture was scanned for authorization,
+  token, API-key, bearer, and sk-* material before normalization. No match was
+  present. The raw capture and disposable package/home were then removed.

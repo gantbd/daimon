@@ -121,10 +121,10 @@
   `RejectOnce` option, granting no capability, retaining terminal evidence and
   verifying the nonexistent target remained absent. The installed 1.8.0 bridge
   retains historical adapter-gate evidence but is below the TCK-qualified floor.
-  A hermetic Daimon-owned executable restart/recovery journey now passes; a
-  genuine installed-provider restart remains open even though the upstream
-  provider's direct resume requirement passes.
-- [Implemented; genuine-provider qualification open] Separate the durable
+  A hermetic Daimon-owned executable restart/recovery journey now passes. The
+  genuine pinned 2.6.0 provider also passes fresh-process restart/reattach after
+  one explicitly authorized no-tool seed turn, with zero history replay.
+- [Implemented and genuinely provider-qualified] Separate the durable
   Daimon session graph from its ephemeral provider-process binding. Add a
   bounded host-only recovery
   locator, a visible reattachment-required state, and an explicit revisioned
@@ -134,11 +134,12 @@
   Active-turn loss remains outcome-unknown; startup must not auto-resume or fall
   back to `session/new`. Qualify canonical checkpoint/wire behavior, ambiguous
   commits, exact idempotent replay, a hermetic two-process adapter journey, and a
-  genuine 2.6.0 restart/resume journey before closing the remaining external
-  qualification item. The guarded genuine-provider gate now exists. An isolated
+  genuine 2.6.0 restart/resume journey. The guarded genuine-provider gate now
+  passes. An isolated
   no-prompt run proved Codex removes an empty rollout and the next process fails
   closed, so executing the final gate requires one explicitly authorized bounded
-  seed turn before process exit.
+  seed turn before process exit; the authorized gate then proved exact
+  fresh-process resume without history replay or fallback session creation.
 - [Externally blocked credential lane] The installed Gemini CLI `0.68.0`
   negotiates ACP v1, but this host's `oauth-personal` lane is an individual
   account path that Google stopped serving in Gemini CLI on 2026-06-18. Its

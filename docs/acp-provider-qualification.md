@@ -30,7 +30,7 @@ identity and a plan whose entries are not an array produce no tool/plan evidence
 
 | Provider path | Qualified version | Result | Evidence boundary |
 | --- | --- | --- | --- |
-| `codex-acp` | `@agentclientprotocol/codex-acp 2.6.0` | Current ACP v1 TCK and Daimon adapter gates passed | A disposable, integrity-pinned 2.6.0 install negotiated ACP v1 on 2026-11-16. Upstream `acp-tck` 0.3.0 returned a conformant verdict with all 32 mandatory and all 19 exercised advertised-capability requirements passing. Daimon's independent adapter gates then passed initialize/session-create/close, one bounded no-tool prompt with nonempty assistant output and completed terminal evidence, and one typed permission challenge resolved only through its exact `RejectOnce` option. The target remained absent and no capability was granted. The isolated home contained only an auth-file symlink plus an in-memory model/reasoning pin; neither the global package nor active user configuration was changed. The TCK's three advisory requirement failures and one informational shutdown-timing failure are retained below as explicit non-claims. |
+| `codex-acp` | `@agentclientprotocol/codex-acp 2.6.0` | Current ACP v1 TCK and Daimon adapter gates passed | A disposable, integrity-pinned 2.6.0 install negotiated ACP v1 on 2026-11-16. Upstream `acp-tck` 0.3.0 returned a conformant verdict with all 32 mandatory and all 19 exercised advertised-capability requirements passing. Daimon's independent adapter gates then passed initialize/session-create/close, one bounded no-tool prompt with nonempty assistant output and completed terminal evidence, one typed permission challenge resolved only through its exact `RejectOnce` option, and genuine fresh-process restart/reattach after one explicitly authorized no-tool seed turn with zero history replay. The target remained absent and no capability was granted. The isolated home contained only an auth-file symlink plus an in-memory model/reasoning pin; neither the global package nor active user configuration was changed. The TCK's three advisory requirement failures and one informational shutdown-timing failure are retained below as explicit non-claims. |
 | `codex-acp` historical baseline | `@agentclientprotocol/codex-acp 1.8.0` | Daimon gates passed; upstream TCK did not conform | The installed 1.8.0 bridge passed the same Daimon lifecycle, prompt, and reject-once permission paths. The pinned upstream TCK nevertheless failed two advertised capability requirements, `ACP-DELETE-001` and `ACP-RESUME-001`, so this version is historical adapter evidence rather than the recommended qualified provider floor. Earlier 0.10.0 prompt evidence is older still. |
 | `gemini --acp` | Gemini CLI `0.68.0` | Consumer-OAuth entitlement blocked after initialize | Rechecked 2026-11-16: the current no-prompt adapter gate still reached `OutcomeUnknown` during open before session admission. The host selects `oauth-personal`, with no Gemini API-key or Google Cloud project variable present, and the preceding raw provider evidence was `UNSUPPORTED_CLIENT` after successful ACP v1 initialize. Inspection of the installed 0.68.0 path shows `session/new` calls `refreshAuth` before it examines the client's filesystem capability, and maps that exception to JSON-RPC `-32000`; this is not evidence of an ACP client-capability mismatch. Google's [official transition notice](https://github.com/google-gemini/gemini-cli/discussions/28017) says Gemini CLI stopped serving individual free, Google AI Pro, and Google AI Ultra accounts on 2026-06-18 while enterprise licenses and API-key authentication remain supported. No prompt was sent. Gemini remains unqualified on this host until an explicitly selected supported credential lane is exercised. |
 | Claude ACP bridge | Claude Code `2.1.311`; no bridge installed | Not applicable as ACP; separate transport passed | The installed `claude` command exposes no native ACP mode and no separate `claude-agent-acp` command is present. Its documented bidirectional `stream-json` Agent SDK transport now has the separate `daimon-claude` adapter, which passed a genuine no-prompt initialize/close gate; see [`claude-provider-qualification.md`](claude-provider-qualification.md). It is not presented as ACP. |
@@ -120,8 +120,13 @@ necessary without spending a model turn: the first process created an empty,
 non-ephemeral thread, but after process exit the fresh app server rejected
 `thread/resume` with `no rollout found`. Daimon surfaced only `OutcomeUnknown`.
 No fallback `session/new`, `session/load`, prompt, or retry occurred. The
-explicit-spend gate above is therefore the remaining genuine-provider proof,
-not a relaxation of reattach semantics.
+explicit-spend gate above subsequently passed against the same pinned 2.6.0
+bridge using the existing authenticated Codex session and no API key. After one
+fixed no-tool seed turn, Daimon dropped the first provider process, launched a
+fresh process, performed only explicit `session/resume`, returned the canonical
+session to Ready with the same recovery locator, and observed zero replayed
+events. The reviewed normalized shell capture is retained at
+[`evidence/codex-acp-2.6.0-reattach-2026-11-16.txt`](evidence/codex-acp-2.6.0-reattach-2026-11-16.txt).
 A matching hermetic regression makes that boundary permanent: its provider
 returns the same `no rollout found` error for `session/resume` and exits if the
 adapter attempts `session/new`; Daimon returns only `OutcomeUnknown` without a
@@ -153,8 +158,7 @@ proves file mutation is denied; it does not certify a deployment's policy.
 Still open before a production claim: a non-macOS sandbox backend and reviewed
 provider-specific Seatbelt policy, authenticated Gemini session creation through
 an explicitly selected supported API-key or enterprise lane, Claude live-model
-qualification, a genuine Codex restart/resume journey, prompt and permission
-journeys for the other providers,
+qualification, prompt and permission journeys for the other providers,
 a live mixed-provider prompt ensemble, and disposition of the TCK advisory and
 informational findings. The upstream experimental ACP compatibility kit has now
 been executed against both Codex bridge versions; its bounded evidence is below.
@@ -229,8 +233,9 @@ active turn outcome-unknown. The canonical design is in
 [`specification.md`](../specification.md#provider-binding-recovery). Its
 checkpoint, service and adapter gates now pass, and the real
 `daimon-local-agent` executable is killed and reopened around a live hermetic
-resume-capable ACP child before an explicit reattach and new prompt. That gate
-does not substitute for the still-open genuine Codex restart/resume journey.
+resume-capable ACP child before an explicit reattach and new prompt. The
+separate genuine Codex 2.6.0 gate now proves the corresponding fresh-provider-
+process resume boundary after one authorized seed turn.
 
 ## Client-operation boundary
 

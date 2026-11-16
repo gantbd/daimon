@@ -132,8 +132,10 @@ file mutation and successful provider negotiation. Linux isolation and
 deployment-specific policy adequacy remain open. A disposable
 `codex-acp` 2.6.0 bridge has passed the pinned upstream ACP v1 TCK (32/32
 mandatory and 19/19 exercised advertised-capability requirements) plus Daimon's
-independent lifecycle, bounded no-tool prompt, and exact reject-once permission
-gates. The installed 1.8.0 bridge passed those Daimon paths but failed the TCK's
+independent lifecycle, bounded no-tool prompt, exact reject-once permission,
+and genuine fresh-process restart/reattach gates. The restart gate used one
+explicitly authorized no-tool seed turn and observed zero history replay. The
+installed 1.8.0 bridge passed those Daimon paths but failed the TCK's
 advertised delete and resume requirements, so it is historical evidence rather
 than the qualified provider floor. The installed Gemini CLI negotiates ACP v1 but
 its selected individual-OAuth lane is provider-deprecated and returns
