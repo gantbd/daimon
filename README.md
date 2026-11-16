@@ -1,5 +1,10 @@
 # Daimon
 
+Status: published through the qualified GitHub source channel at the exact
+revision and CI run recorded in
+[`release/github-source.json`](release/github-source.json). No registry or
+binary publication is authorized.
+
 Daimon is the provider-neutral agent harness protocol and execution runtime.
 It executes already-authorized work under explicit budgets and returns attributed
 evidence. It does not decide which work exists, schedule retries, define room

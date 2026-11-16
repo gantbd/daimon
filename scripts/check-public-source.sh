@@ -8,7 +8,8 @@ done
 
 rg -q '^channel = "1\.95\.0"$' rust-toolchain.toml || { echo 'Daimon toolchain is not pinned' >&2; exit 1; }
 rg -q '"channel": "github-coordinated-source"' release/github-source.json || { echo 'Daimon GitHub source channel missing' >&2; exit 1; }
-rg -q '"remoteReachabilityQualified": false' release/github-source.json || { echo 'Daimon source profile claims unverified reachability' >&2; exit 1; }
+rg -q '"remoteReachabilityQualified": true' release/github-source.json || { echo 'Daimon source reachability is not qualified' >&2; exit 1; }
+rg -q '"qualificationRevision": "325e662a6a945cf8a064b9812ebbbdac02be4130"' release/github-source.json || { echo 'Daimon source qualification revision drifted' >&2; exit 1; }
 for revision in 2e4faf10ec0a70805aa1db1555f93c77fcf0a1e4 b272106cf6d0093839a7d696c829bf8a408b0306 ebff27188388cd0249d07751b1cc848c6ef1a3f9; do
   rg -q "\"revision\": \"$revision\"" release/github-source.json || { echo "Daimon source revision missing: $revision" >&2; exit 1; }
 done
