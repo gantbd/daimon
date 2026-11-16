@@ -195,6 +195,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "daimon-agent-command"
+version = "0.1.0"
+dependencies = [
+ "daimon-client",
+ "daimon-protocol",
+]
+
+[[package]]
 name = "daimon-agent-router"
 version = "0.0.1"
 dependencies = [

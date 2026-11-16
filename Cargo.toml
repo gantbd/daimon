@@ -29,6 +29,7 @@ members = [
   "adapters/daimon-local",
   "adapters/daimon-openai-local",
   "crates/daimon-client",
+  "crates/daimon-agent-command",
   "crates/daimon-host",
   "crates/daimon-local-daemon",
   "crates/daimon-process",
