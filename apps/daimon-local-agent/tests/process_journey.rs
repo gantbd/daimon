@@ -16,12 +16,16 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static PROCESS_JOURNEY: Mutex<()> = Mutex::new(());
 
 struct AegisAuthentication;
 
@@ -389,6 +393,7 @@ fn execution(seed: u8, idempotency: u8) -> protocol::ExecuteRequestV1 {
 
 #[test]
 fn executable_crosses_authority_attempt_provider_and_durable_reopen() {
+    let _journey = PROCESS_JOURNEY.lock().unwrap();
     let fixture = Fixture::new();
     let aegis = start_aegis(&fixture, 2);
     let chronos = start_chronos(&fixture);
@@ -528,6 +533,7 @@ fn executable_crosses_authority_attempt_provider_and_durable_reopen() {
 
 #[test]
 fn executable_restarts_idle_acp_session_and_requires_explicit_reattach() {
+    let _journey = PROCESS_JOURNEY.lock().unwrap();
     let fixture = Fixture::new();
     let aegis = start_aegis(&fixture, 2);
     let chronos = start_chronos(&fixture);
