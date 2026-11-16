@@ -205,9 +205,10 @@
   paths with identical authorization, no-redispatch, cancellation, and
   outcome-unknown behavior.
 - The first mutation slices now reuse Daimon-owned exact-state guards:
-  active-turn advance, prompt dispatch, and exact permission decisions. Prompt
+  active-turn advance and cancellation, prompt dispatch, and exact permission decisions. Prompt
   confirmation binds raw content and the complete credential-free execution
   envelope by digest; permission confirmation additionally binds the complete
-  cursor-identified provider challenge. Cancel, close, reattach and native-host
-  slices retain this phase's requirements.
+  cursor-identified provider challenge. Cancel accepts both turn-active and
+  permission-waiting state and preserves uncertain delivery without retry.
+  Close, reattach and native-host slices retain this phase's requirements.
 

@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 pub const ADVANCE_CAPABILITY: &str = "agents.session.advance.v1";
 pub const PROMPT_CAPABILITY: &str = "agents.session.prompt.v1";
 pub const PERMISSION_CAPABILITY: &str = "agents.session.permission.v1";
+pub const CANCEL_CAPABILITY: &str = "agents.session.cancel.v1";
 pub const CAPABILITY: &str = ADVANCE_CAPABILITY;
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub const MAX_CONTEXT_REFERENCES: usize = 64;
@@ -496,6 +497,102 @@ pub struct AdvanceRequest {
     pub now: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CancelRequest {
+    pub session: AgentSessionIdV1,
+    pub turn: AgentTurnIdV1,
+    pub expected_revision: u64,
+    pub idempotency_key: IdempotencyKeyV1,
+    pub now: u64,
+}
+
+impl CancelRequest {
+    pub fn confirmation(self) -> String {
+        format!(
+            "CANCEL DAIMON SESSION {} TURN {} REVISION {} KEY {} AT {}",
+            hex(&self.session.into_bytes()),
+            hex(&self.turn.into_bytes()),
+            self.expected_revision,
+            hex(&self.idempotency_key.into_bytes()),
+            self.now,
+        )
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CancelError<E> {
+    ConfirmationMismatch { required: String },
+    ObservationTransport(E),
+    ObservationRefused(AgentRefusalV1),
+    InvalidObservation,
+    SessionChanged { actual: AgentSessionViewV1 },
+    MutationTransport(E),
+    MutationRefused(AgentRefusalV1),
+    InvalidMutationReply,
+}
+
+pub fn cancel<P: AgentServicePort>(
+    service_session: SessionHandleV1,
+    port: P,
+    request: CancelRequest,
+    confirmation: &str,
+) -> Result<AgentOutcomeV1, CancelError<P::Error>> {
+    let required = request.confirmation();
+    if confirmation != required {
+        return Err(CancelError::ConfirmationMismatch { required });
+    }
+
+    let mut observer = AgentReadOnlyClient::new(service_session, port);
+    let current = match observer.inspect(request.session) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == request.session =>
+        {
+            view
+        }
+        Ok(AgentReplyV1::Accepted(_)) => return Err(CancelError::InvalidObservation),
+        Ok(AgentReplyV1::Refused(refusal)) => {
+            return Err(CancelError::ObservationRefused(refusal));
+        }
+        Err(error) => return Err(CancelError::ObservationTransport(error)),
+    };
+    if current.revision != request.expected_revision
+        || !matches!(
+            current.phase,
+            AgentSessionPhaseV1::TurnActive | AgentSessionPhaseV1::AwaitingPermission
+        )
+        || current.active_turn != Some(request.turn)
+    {
+        return Err(CancelError::SessionChanged { actual: current });
+    }
+
+    let mut operator = AgentSessionClient::new(service_session, observer.into_port());
+    match operator.cancel(
+        request.session,
+        request.turn,
+        request.expected_revision,
+        request.idempotency_key,
+        request.now,
+    ) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == request.session =>
+        {
+            Ok(AgentOutcomeV1::Session(view))
+        }
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::OutcomeUnknown {
+            session,
+            idempotency_key,
+        })) if session == request.session && idempotency_key == request.idempotency_key => {
+            Ok(AgentOutcomeV1::OutcomeUnknown {
+                session,
+                idempotency_key,
+            })
+        }
+        Ok(AgentReplyV1::Accepted(_)) => Err(CancelError::InvalidMutationReply),
+        Ok(AgentReplyV1::Refused(refusal)) => Err(CancelError::MutationRefused(refusal)),
+        Err(error) => Err(CancelError::MutationTransport(error)),
+    }
+}
+
 impl AdvanceRequest {
     pub fn confirmation(self) -> String {
         format!(
@@ -693,6 +790,16 @@ mod tests {
             option: AgentPermissionOptionIdV1::new([22; 16]),
             execution: prompt_request().execution,
             now: 34,
+        }
+    }
+
+    fn cancel_request() -> CancelRequest {
+        CancelRequest {
+            session: request().session,
+            turn: request().turn,
+            expected_revision: request().expected_revision,
+            idempotency_key: request().idempotency_key,
+            now: request().now,
         }
     }
 
@@ -989,6 +1096,100 @@ mod tests {
             parse_prompt_document(unknown.as_bytes(), b"review".to_vec()),
             Err(PromptDocumentError::Malformed)
         );
+    }
+
+    #[test]
+    fn exact_confirmation_and_active_state_attempt_one_cancel() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut cancelled = view(13, AgentSessionPhaseV1::Ready);
+        cancelled.active_turn = None;
+        assert_eq!(
+            cancel(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view(
+                            12,
+                            AgentSessionPhaseV1::AwaitingPermission,
+                        )))),
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(
+                            cancelled.clone(),
+                        ))),
+                    ],
+                },
+                cancel_request(),
+                &cancel_request().confirmation(),
+            ),
+            Ok(AgentOutcomeV1::Session(cancelled))
+        );
+        assert!(matches!(
+            commands.borrow()[0],
+            AgentCommandV1::Inspect { .. }
+        ));
+        assert!(matches!(
+            commands.borrow()[1],
+            AgentCommandV1::Cancel { .. }
+        ));
+        assert_eq!(commands.borrow().len(), 2);
+    }
+
+    #[test]
+    fn cancel_confirmation_and_state_fences_prevent_mutation() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        assert!(matches!(
+            cancel(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![],
+                },
+                cancel_request(),
+                "cancel",
+            ),
+            Err(CancelError::ConfirmationMismatch { .. })
+        ));
+        assert!(commands.borrow().is_empty());
+
+        let mut ready = view(12, AgentSessionPhaseV1::Ready);
+        ready.active_turn = None;
+        assert!(matches!(
+            cancel(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(ready,)))],
+                },
+                cancel_request(),
+                &cancel_request().confirmation(),
+            ),
+            Err(CancelError::SessionChanged { .. })
+        ));
+        assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn lost_cancel_reply_is_returned_without_retry() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        assert_eq!(
+            cancel(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![
+                        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view(
+                            12,
+                            AgentSessionPhaseV1::TurnActive,
+                        )))),
+                        Err("lost"),
+                    ],
+                },
+                cancel_request(),
+                &cancel_request().confirmation(),
+            ),
+            Err(CancelError::MutationTransport("lost"))
+        );
+        assert_eq!(commands.borrow().len(), 2);
     }
 
     #[test]

@@ -206,8 +206,11 @@ fenced `Advance` mutation. It grants no new execution authority, admits only a
 bounded progress observation (including an honest empty still-active slice),
 permission request, or terminal evidence, and leaves
 the service free to accept cancellation while an ACP prompt remains pending.
-`daimon-agent-command` now exposes matching owner-side guards for advance and
-prompt operator paths. The prompt guard accepts the complete credential-free
+`daimon-agent-command` now exposes matching owner-side guards for advance,
+cancel and prompt operator paths. The cancel guard observes the exact active
+turn and revision, accepts both ordinary active and permission-waiting phases,
+requires an exact confirmation, and attempts the replay-safe attenuation once
+without retrying transport-uncertain delivery. The prompt guard accepts the complete credential-free
 execution envelope plus bounded prompt bytes, binds both by digest in an exact
 confirmation, observes the exact ready revision on the mutation connection and
 attempts once. It preserves outcome-unknown evidence and never redispatches a
