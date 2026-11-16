@@ -334,14 +334,25 @@ fn write_resume_config(fixture: &Fixture) {
 
 fn start_agent(fixture: &Fixture) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
+        .arg("--supervised")
         .arg(&fixture.config)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     wait_for_socket(&fixture.agent_socket, Duration::from_secs(5));
     child
+}
+
+fn stop_agent(child: &mut Child, socket: &Path) {
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "supervised agent shutdown failed: {status}"
+    );
+    assert!(!socket.exists(), "supervised agent retained its socket");
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
@@ -466,9 +477,7 @@ fn executable_crosses_authority_attempt_provider_and_durable_reopen() {
     };
     assert_eq!(closed.phase, AgentSessionPhaseV1::Closed);
     drop(client);
-    first.kill().unwrap();
-    first.wait().unwrap();
-    let _ = fs::remove_file(&fixture.agent_socket);
+    stop_agent(&mut first, &fixture.agent_socket);
 
     let mut second = start_agent(&fixture);
     let (service_session, port) = daimon_client::unix::connect_agent(
@@ -511,8 +520,7 @@ fn executable_crosses_authority_attempt_provider_and_durable_reopen() {
         }
     )));
     drop(reader);
-    second.kill().unwrap();
-    second.wait().unwrap();
+    stop_agent(&mut second, &fixture.agent_socket);
 
     chronos.join().unwrap();
     aegis.join().unwrap();
@@ -560,9 +568,7 @@ fn executable_restarts_idle_acp_session_and_requires_explicit_reattach() {
     assert!(opened.capabilities.resume_session);
     assert!(opened.active_turn.is_none());
     drop(client);
-    first.kill().unwrap();
-    first.wait().unwrap();
-    let _ = fs::remove_file(&fixture.agent_socket);
+    stop_agent(&mut first, &fixture.agent_socket);
 
     let mut second = start_agent(&fixture);
     let (service_session, port) = daimon_client::unix::connect_agent(
@@ -686,8 +692,7 @@ fn executable_restarts_idle_acp_session_and_requires_explicit_reattach() {
         }
     )));
     drop(reader);
-    second.kill().unwrap();
-    second.wait().unwrap();
+    stop_agent(&mut second, &fixture.agent_socket);
 
     chronos.join().unwrap();
     aegis.join().unwrap();

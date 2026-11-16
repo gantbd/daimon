@@ -13,6 +13,13 @@ cargo run -p daimon-local-agent --locked --offline -- \
   --check config/local-agent.example.json
 ```
 
+Deployment supervisors may select `--supervised CONFIG.json`. The process then
+accepts one exact `x` byte on standard input as a drain request, finishes the
+current bounded connection, drops the daemon so its owned socket is removed,
+and exits successfully. EOF and other bytes are not shutdown authority. This
+control channel carries no Daimon command, provider input, credential, or
+checkpoint content.
+
 Provider programs, arguments, inherited environment names, and workspace paths
 are deployment-owned. Public protocol and checkpoint state retain only opaque
 identities and credential-free digests. A profile document digest is derived by

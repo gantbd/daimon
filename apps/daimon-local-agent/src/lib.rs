@@ -38,6 +38,11 @@ use std::{
     os::unix::net::UnixStream,
     path::{Component, Path, PathBuf},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -979,6 +984,37 @@ fn dangerous_terminal_flag(program: &Path, arguments: &[String]) -> bool {
 }
 
 pub fn run(config: ValidatedConfigV1) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_shutdown(config, None)
+}
+
+/// Runs the production agent service under an explicit one-byte supervisor
+/// channel. Only `x` requests shutdown; EOF and every other byte leave the
+/// service running. The wake connection carries no application command and is
+/// used only to release the blocking local accept after the request is set.
+pub fn run_supervised<R>(
+    config: ValidatedConfigV1,
+    mut shutdown: R,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    R: Read + Send + 'static,
+{
+    let requested = Arc::new(AtomicBool::new(false));
+    let observer = Arc::clone(&requested);
+    let socket = config.raw.daimon_socket.clone();
+    thread::spawn(move || {
+        let mut request = [0_u8; 1];
+        if shutdown.read_exact(&mut request).is_ok() && request == *b"x" {
+            observer.store(true, Ordering::Release);
+            let _ = UnixStream::connect(socket);
+        }
+    });
+    run_with_shutdown(config, Some(requested))
+}
+
+fn run_with_shutdown(
+    config: ValidatedConfigV1,
+    shutdown: Option<Arc<AtomicBool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_millis(config.raw.io_timeout_ms);
     let (session, aegis_port) = aegis_local_daemon::unix::connect(
         &config.raw.aegis_socket,
@@ -1092,9 +1128,20 @@ pub fn run(config: ValidatedConfigV1) -> Result<(), Box<dyn std::error::Error>> 
         config.raw.max_requests_per_connection,
     )?;
     loop {
-        daemon
-            .serve_next()
-            .map_err(|_| failure("agent daemon connection failed"))?;
+        if shutdown
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        let served = daemon.serve_next();
+        if shutdown
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        served.map_err(|_| failure("agent daemon connection failed"))?;
     }
 }
 

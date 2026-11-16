@@ -1,22 +1,24 @@
-use std::{env, process::ExitCode};
+use std::{env, io, process::ExitCode};
+
+const USAGE: &str = "usage: daimon-local-agent [--check | --supervised] CONFIG.json";
 
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
-        eprintln!("usage: daimon-local-agent [--check] CONFIG.json");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let (check, path) = if first == "--check" {
+    let (check, supervised, path) = if first == "--check" || first == "--supervised" {
         let Some(path) = arguments.next() else {
-            eprintln!("usage: daimon-local-agent [--check] CONFIG.json");
+            eprintln!("{USAGE}");
             return ExitCode::from(2);
         };
-        (true, path)
+        (first == "--check", first == "--supervised", path)
     } else {
-        (false, first)
+        (false, false, first)
     };
     if arguments.next().is_some() {
-        eprintln!("usage: daimon-local-agent [--check] CONFIG.json");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
     let config = match daimon_local_agent::load(path) {
@@ -30,7 +32,12 @@ fn main() -> ExitCode {
         println!("local agent configuration valid");
         return ExitCode::SUCCESS;
     }
-    match daimon_local_agent::run(config) {
+    let result = if supervised {
+        daimon_local_agent::run_supervised(config, io::stdin())
+    } else {
+        daimon_local_agent::run(config)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("local agent daemon: {error}");
