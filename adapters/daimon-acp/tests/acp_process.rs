@@ -13,10 +13,11 @@ use daimon_protocol::{self as protocol, agent::*};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
+    fs,
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn profile() -> AgentProfileSnapshotV1 {
@@ -196,6 +197,58 @@ fn execution(seed: u8, idempotency: u8) -> protocol::ExecuteRequestV1 {
 
 fn provider(mode: &str) -> AcpProvider {
     provider_with_environment(mode, Vec::new())
+}
+
+fn controlled_provider(mode: &str, control: &std::path::Path) -> AcpProvider {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_acp_agent.sh");
+    AcpProvider::try_new(
+        AcpLimitsV1 {
+            startup_timeout: Duration::from_secs(2),
+            slice_wait: Duration::from_millis(20),
+            cancellation_timeout: Duration::from_secs(2),
+            close_timeout: Duration::from_secs(2),
+            ..AcpLimitsV1::default()
+        },
+        vec![AcpLaunchProfileV1 {
+            snapshot: profile(),
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                script.into_os_string(),
+                OsString::from(mode),
+                control.into(),
+            ],
+            inherited_environment_names: Vec::new(),
+            agent_authentication_method: None,
+            isolation: ProcessIsolationV1::Direct,
+        }],
+        vec![AcpWorkspaceV1 {
+            identity: [8; 16],
+            path: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        }],
+    )
+    .unwrap()
+}
+
+fn control_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("daimon-acp-{name}-{}", std::process::id()))
+}
+
+fn release_and_wait_for_emission(control: &std::path::Path) {
+    let gate = control.with_extension("gate");
+    let emitted = control.with_extension("emitted");
+    let _ = fs::remove_file(&gate);
+    let _ = fs::remove_file(&emitted);
+    fs::write(&gate, []).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !emitted.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "ACP fixture did not emit terminal evidence"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    fs::remove_file(gate).unwrap();
+    fs::remove_file(emitted).unwrap();
 }
 
 fn provider_with_agent_authentication(mode: &str, method: &str) -> AcpProvider {
@@ -900,7 +953,8 @@ fn delayed_file_read_uses_the_advance_logical_time() {
 
 #[test]
 fn real_stdio_process_streams_bounded_progress_then_terminal_evidence() {
-    let mut provider = provider("stream");
+    let control = control_path("stream");
+    let mut provider = controlled_provider("controlled_stream", &control);
     open(&mut provider);
     let AgentProviderOutcomeV1::Receipt(first) = prompt(&mut provider) else {
         panic!("first progress slice expected")
@@ -910,7 +964,7 @@ fn real_stdio_process_streams_bounded_progress_then_terminal_evidence() {
         first.events[0].event,
         AgentEventV1::AssistantMessage { .. }
     ));
-    thread::sleep(Duration::from_millis(100));
+    release_and_wait_for_emission(&control);
     let AgentProviderOutcomeV1::Receipt(second) =
         provider.invoke_agent(&AgentProviderInvocationV1::Advance {
             session: protocol::AgentSessionIdV1::new([9; 16]),
@@ -1070,13 +1124,14 @@ fn cancellation_is_sent_while_original_prompt_remains_pending() {
 
 #[test]
 fn completion_winning_the_cancel_race_is_not_rewritten_as_cancelled() {
-    let mut provider = provider("cancel_race");
+    let control = control_path("cancel-race");
+    let mut provider = controlled_provider("controlled_cancel_race", &control);
     open(&mut provider);
     let AgentProviderOutcomeV1::Receipt(active) = prompt(&mut provider) else {
         panic!("active slice expected")
     };
     assert_eq!(active.phase, AgentSessionPhaseV1::TurnActive);
-    thread::sleep(Duration::from_millis(70));
+    release_and_wait_for_emission(&control);
     let AgentProviderOutcomeV1::Receipt(completed) =
         provider.invoke_agent(&AgentProviderInvocationV1::Cancel {
             session: protocol::AgentSessionIdV1::new([9; 16]),

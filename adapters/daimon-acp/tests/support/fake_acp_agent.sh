@@ -115,11 +115,18 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/prompt"'*)
       case "$mode" in
-        stream)
+        stream|controlled_stream)
           printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first slice"}}}}'
-          sleep 0.08
+          if [ "$mode" = "controlled_stream" ]; then
+            while [ ! -f "$fixture_path.gate" ]; do sleep 0.01; done
+          else
+            sleep 0.08
+          fi
           printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second slice"}}}}'
           printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+          if [ "$mode" = "controlled_stream" ]; then
+            : > "$fixture_path.emitted"
+          fi
           ;;
         resume)
           printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resumed session"}}}}'
@@ -131,10 +138,17 @@ while IFS= read -r line; do
         cancel)
           printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}}}'
           ;;
-        cancel_race)
+        cancel_race|controlled_cancel_race)
           printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}}}'
-          sleep 0.05
+          if [ "$mode" = "controlled_cancel_race" ]; then
+            while [ ! -f "$fixture_path.gate" ]; do sleep 0.01; done
+          else
+            sleep 0.05
+          fi
           printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+          if [ "$mode" = "controlled_cancel_race" ]; then
+            : > "$fixture_path.emitted"
+          fi
           ;;
         silent)
           :
