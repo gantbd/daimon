@@ -93,7 +93,11 @@ fn start_aegis(fixture: &Fixture, request_count: usize) -> thread::JoinHandle<()
         service,
         AegisAuthentication,
         aegis_wire::LimitsV1::default(),
-        Duration::from_secs(3),
+        // The terminal-boundary qualification deliberately keeps this authority
+        // connection open while a real child process runs. Hosted macOS runners
+        // can take just over three seconds there, so the fixture must not turn a
+        // healthy idle interval into a synthetic transport failure.
+        Duration::from_secs(15),
         16,
     )
     .unwrap();
