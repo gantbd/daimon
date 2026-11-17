@@ -361,6 +361,7 @@ impl AgentClientFileReader for GovernedFileReader {
 fn governed_file_provider(
     mode: &str,
     expected_now: u64,
+    control: Option<&std::path::Path>,
 ) -> (
     AcpProvider,
     Arc<Mutex<Vec<daimon_host::agent::AgentFileReadRequestV1>>>,
@@ -369,6 +370,14 @@ fn governed_file_provider(
     let requested_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let requested_bytes = requested_path.to_str().unwrap().as_bytes().to_vec();
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut arguments = vec![
+        script.into_os_string(),
+        OsString::from(mode),
+        requested_path.into_os_string(),
+    ];
+    if let Some(control) = control {
+        arguments.push(control.into());
+    }
     let provider = AcpProvider::try_new_with_file_reader(
         AcpLimitsV1 {
             startup_timeout: Duration::from_secs(2),
@@ -380,11 +389,7 @@ fn governed_file_provider(
         vec![AcpLaunchProfileV1 {
             snapshot: profile(),
             program: PathBuf::from("/bin/sh"),
-            arguments: vec![
-                script.into_os_string(),
-                OsString::from(mode),
-                requested_path.into_os_string(),
-            ],
+            arguments,
             inherited_environment_names: Vec::new(),
             agent_authentication_method: None,
             isolation: ProcessIsolationV1::Direct,
@@ -892,7 +897,7 @@ fn prompt(provider: &mut AcpProvider) -> AgentProviderOutcomeV1 {
 
 #[test]
 fn governed_client_file_read_preserves_canonical_binding_and_digest_evidence() {
-    let (mut provider, calls) = governed_file_provider("file_read", 20);
+    let (mut provider, calls) = governed_file_provider("file_read", 20, None);
     let opened = open_receipt(&mut provider);
     assert!(opened.capabilities.filesystem_read);
     assert!(!opened.capabilities.filesystem_write);
@@ -925,14 +930,15 @@ fn governed_client_file_read_preserves_canonical_binding_and_digest_evidence() {
 
 #[test]
 fn delayed_file_read_uses_the_advance_logical_time() {
-    let (mut provider, calls) = governed_file_provider("file_read_delayed", 99);
+    let control = control_path("file-read");
+    let (mut provider, calls) = governed_file_provider("controlled_file_read", 99, Some(&control));
     open(&mut provider);
     let AgentProviderOutcomeV1::Receipt(active) = prompt(&mut provider) else {
         panic!("active slice expected")
     };
     assert_eq!(active.phase, AgentSessionPhaseV1::TurnActive);
     assert!(calls.lock().unwrap().is_empty());
-    thread::sleep(Duration::from_millis(100));
+    release_and_wait_for_emission(&control);
     let AgentProviderOutcomeV1::Receipt(completed) =
         provider.invoke_agent(&AgentProviderInvocationV1::Advance {
             session: protocol::AgentSessionIdV1::new([9; 16]),

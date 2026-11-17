@@ -35,7 +35,7 @@ while IFS= read -r line; do
             *) exit 45 ;;
           esac
           ;;
-        file_read|file_read_delayed)
+        file_read|file_read_delayed|controlled_file_read)
           case "$line" in
             *'"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":false},"terminal":false}'*) ;;
             *) exit 46 ;;
@@ -193,6 +193,13 @@ while IFS= read -r line; do
           [ -n "$fixture_path" ] || exit 47
           sleep 0.08
           printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"read-1\",\"method\":\"fs/read_text_file\",\"params\":{\"sessionId\":\"fixture-session\",\"path\":\"$fixture_path\",\"line\":1,\"limit\":1}}"
+          ;;
+        controlled_file_read)
+          [ -n "$fixture_path" ] || exit 47
+          control_path="${3:?control path required}"
+          while [ ! -f "$control_path.gate" ]; do sleep 0.01; done
+          printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":\"read-1\",\"method\":\"fs/read_text_file\",\"params\":{\"sessionId\":\"fixture-session\",\"path\":\"$fixture_path\",\"line\":1,\"limit\":1}}"
+          : > "$control_path.emitted"
           ;;
         terminal|terminal_cancel)
           terminal_cwd="${fixture_path:-$(pwd)}"
