@@ -263,7 +263,10 @@ pub fn decide_permission<P: AgentServicePort>(
     }
 }
 
-fn permission_confirmation(
+/// Returns the exact confirmation for a previously observed permission
+/// challenge. The guarded mutation re-observes that cursor and rejects any
+/// changed request, turn, option set, or session revision before dispatch.
+pub fn permission_confirmation(
     request: &PermissionRequest,
     challenge: &AgentPermissionRequestV1,
 ) -> String {
