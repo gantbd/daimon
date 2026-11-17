@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: gantbd/chronos
-          ref: ebff27188388cd0249d07751b1cc848c6ef1a3f9
+          ref: 26366ec9172b48280d9bba3688572edf1c0d2719
           path: chronos
           persist-credentials: false
       - name: Install pinned Rust toolchain
