@@ -446,6 +446,7 @@ fn execute_once(
                     description: "Deployment-authorized structured capability".into(),
                     parameters: serde_json::json!({
                         "type": "object",
+                        "properties": {},
                         "additionalProperties": true
                     }),
                 },

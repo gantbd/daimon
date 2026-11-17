@@ -287,6 +287,7 @@ pub struct ModelToolResultV1 {
 pub struct ModelContinuationV1 {
     pub source_execution: ExecutionId,
     pub source_output: Vec<u8>,
+    pub source_tools: Vec<ToolCapabilityId>,
     pub results: Vec<ModelToolResultV1>,
 }
 
@@ -748,6 +749,13 @@ impl Engine {
             || continuation.source_execution == invocation.execution_id
             || continuation.source_execution.into_bytes() == [0; 16]
             || continuation.source_output.len() > prepared.request.budget.max_output_bytes
+            || continuation.source_tools.is_empty()
+            || continuation
+                .source_tools
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != continuation.source_tools.len()
             || continuation.results.is_empty()
             || continuation.results.len()
                 > usize::try_from(prepared.request.budget.max_tool_calls)
@@ -763,7 +771,7 @@ impl Engine {
                 .checked_add(result.output.len())
                 .ok_or(RefusalV1::OutputLimit)?;
             if result.request == [0; 16]
-                || !invocation.tools.contains(&result.capability)
+                || !continuation.source_tools.contains(&result.capability)
                 || result.provider_correlation.is_empty()
                 || result.provider_correlation.len() > 1_024
                 || result.arguments.is_empty()

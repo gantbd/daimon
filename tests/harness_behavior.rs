@@ -346,6 +346,7 @@ fn model_continuation_binds_exact_native_calls_and_bounded_results() {
     let continuation = ModelContinuationV1 {
         source_execution: ExecutionId::new([9; 16]),
         source_output: Vec::new(),
+        source_tools: vec![ToolCapabilityId::new([6; 16])],
         results: vec![ModelToolResultV1 {
             request: [10; 16],
             capability: ToolCapabilityId::new([6; 16]),

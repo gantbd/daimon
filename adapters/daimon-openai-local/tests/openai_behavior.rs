@@ -286,6 +286,10 @@ fn native_openai_tool_calls_become_capability_bound_typed_proposals() {
         body["tools"][0]["function"]["name"],
         "cap_0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
     );
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"]["properties"],
+        json!({})
+    );
     assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
 }
 

@@ -298,7 +298,15 @@ where
                 input.context.iter().map(core_context).collect(),
                 input.messages.iter().map(core_message).collect(),
                 input.estimated_input_tokens,
-                core_continuation(value),
+                core_continuation(
+                    value,
+                    &self
+                        .executions
+                        .get(&value.source_execution)
+                        .expect("continuation source validated before preparation")
+                        .request
+                        .tools,
+                ),
             ),
         };
         let core_invocation = match prepared_invocation {
@@ -373,7 +381,10 @@ where
             || request.task_attempt != source.request.task_attempt
             || request.profile != source.request.profile
             || request.context != source.request.context
-            || request.tools != source.request.tools
+            || request
+                .tools
+                .iter()
+                .any(|tool| !source.request.tools.contains(tool))
             || !source.invocation.provider.structured_tools
         {
             return refused(protocol::RefusalV1::InvalidInput);
@@ -535,19 +546,30 @@ where
                         .collect(),
                     stored.invocation.estimated_input_tokens,
                 ),
-                Some(continuation) => self.engine.prepare_model_continuation(
-                    &prepared,
-                    profile,
-                    stored.invocation.context.iter().map(core_context).collect(),
-                    stored
-                        .invocation
-                        .messages
-                        .iter()
-                        .map(core_message)
-                        .collect(),
-                    stored.invocation.estimated_input_tokens,
-                    core_continuation(continuation),
-                ),
+                Some(continuation) => {
+                    let source_tools = self
+                        .executions
+                        .get(&continuation.source_execution)
+                        .ok_or(ModelRecoveryError::InvalidSnapshot(
+                            protocol::RefusalV1::InvalidInput,
+                        ))?
+                        .request
+                        .tools
+                        .clone();
+                    self.engine.prepare_model_continuation(
+                        &prepared,
+                        profile,
+                        stored.invocation.context.iter().map(core_context).collect(),
+                        stored
+                            .invocation
+                            .messages
+                            .iter()
+                            .map(core_message)
+                            .collect(),
+                        stored.invocation.estimated_input_tokens,
+                        core_continuation(continuation, &source_tools),
+                    )
+                }
             };
             let core_invocation = prepared_invocation
                 .map_err(|error| ModelRecoveryError::InvalidSnapshot(core_refusal(error)))?;
@@ -620,7 +642,11 @@ fn valid_continuation_link(
         || entry.request.task_attempt != source.request.task_attempt
         || entry.request.profile != source.request.profile
         || entry.request.context != source.request.context
-        || entry.request.tools != source.request.tools
+        || entry
+            .request
+            .tools
+            .iter()
+            .any(|tool| !source.request.tools.contains(tool))
         || entry.invocation.provider != source.invocation.provider
         || continuation.source_output != source_result.output
     {
@@ -715,10 +741,17 @@ fn core_model_receipt(value: &protocol::ModelProviderReceiptV1) -> core::ModelCo
     }
 }
 
-fn core_continuation(value: &protocol::ModelContinuationV1) -> core::ModelContinuationV1 {
+fn core_continuation(
+    value: &protocol::ModelContinuationV1,
+    source_tools: &[protocol::ToolCapabilityIdV1],
+) -> core::ModelContinuationV1 {
     core::ModelContinuationV1 {
         source_execution: core::ExecutionId::new(value.source_execution.into_bytes()),
         source_output: value.source_output.clone(),
+        source_tools: source_tools
+            .iter()
+            .map(|tool| core::ToolCapabilityId::new(tool.into_bytes()))
+            .collect(),
         results: value
             .results
             .iter()

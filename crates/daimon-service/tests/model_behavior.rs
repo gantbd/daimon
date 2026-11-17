@@ -290,6 +290,7 @@ fn completed_native_calls_resume_once_with_exact_retained_provider_correlation()
     let mut resumed = source;
     resumed.execution_id = protocol::ExecutionIdV1::new([30; 16]);
     resumed.idempotency_key = protocol::IdempotencyKeyV1::new([31; 16]);
+    resumed.tools.clear();
     let command = protocol::ModelCommandV1::Resume {
         request: resumed,
         source_execution: protocol::ExecutionIdV1::new([1; 16]),
@@ -304,12 +305,13 @@ fn completed_native_calls_resume_once_with_exact_retained_provider_correlation()
     let reply = service.execute(handle, command.clone());
     let protocol::ModelReplyV1::Accepted(protocol::ModelOutcomeV1::Executed(result)) = &reply
     else {
-        panic!("expected resumed result")
+        panic!("expected resumed result, got {reply:?}")
     };
     assert_eq!(result.output, b"answer after tool");
     let captured = invocations.borrow();
     assert_eq!(captured.len(), 2);
     let continuation = captured[1].continuation.as_ref().unwrap();
+    assert!(captured[1].tools.is_empty());
     assert_eq!(continuation.source_execution.into_bytes(), [1; 16]);
     assert_eq!(continuation.results[0].provider_correlation, b"call-21");
     assert_eq!(continuation.results[0].output, output);
