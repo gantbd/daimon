@@ -424,6 +424,20 @@ fn executable_plans_applies_and_replays_guarded_provider_edit() {
     assert_eq!(replay["disposition"], "already_applied");
     assert_eq!(replay["replayed"], true);
 
+    let no_change_request = serde_json::json!({
+        "version": 1,
+        "operation_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "expected_document_digest": plan["candidate_document_digest"],
+        "provider": plan_request["provider"]
+    });
+    let no_change_output = run_provider_edit(&fixture, "--plan-provider-edit", &no_change_request);
+    assert!(!no_change_output.status.success());
+    assert!(
+        String::from_utf8(no_change_output.stderr)
+            .unwrap()
+            .contains("no apply is needed")
+    );
+
     let stale_output = run_provider_edit(&fixture, "--plan-provider-edit", &plan_request);
     assert!(!stale_output.status.success());
     assert!(

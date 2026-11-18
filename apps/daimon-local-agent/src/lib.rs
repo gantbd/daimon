@@ -315,6 +315,7 @@ pub enum ProviderEditErrorV1 {
     Conflict,
     PlanMismatch,
     Busy,
+    NoChange,
 }
 
 impl std::fmt::Display for ProviderEditErrorV1 {
@@ -326,6 +327,9 @@ impl std::fmt::Display for ProviderEditErrorV1 {
             Self::Conflict => "owner document changed; refresh and review a new plan",
             Self::PlanMismatch => "confirmation does not match the reviewed plan",
             Self::Busy => "another provider edit is in progress; try again after it completes",
+            Self::NoChange => {
+                "provider already matches the requested configuration; no apply is needed"
+            }
         };
         write!(formatter, "provider edit: {orientation}")
     }
@@ -419,6 +423,9 @@ pub fn plan_provider_edit_json(
         .iter()
         .find(|provider| provider.provider_id == request.provider.provider_id)
         .cloned();
+    if existing.as_ref() == Some(&request.provider) {
+        return Err(ProviderEditErrorV1::NoChange);
+    }
     let (candidate, candidate_bytes) = candidate_document(current, request.provider.clone())?;
     let candidate_digest = digest_text(Sha256::digest(&candidate_bytes).into());
     let plan_digest =
