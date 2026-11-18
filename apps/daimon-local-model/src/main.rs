@@ -1,22 +1,31 @@
-use std::{env, process::ExitCode};
+use std::{env, io, process::ExitCode};
+
+const USAGE: &str =
+    "usage: daimon-local-model [--check | --describe-providers | --supervised] CONFIG.json";
 
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
-        eprintln!("usage: daimon-local-model [--check | --describe-providers] CONFIG.json");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let (check, describe, path) = if first == "--check" || first == "--describe-providers" {
-        let Some(path) = arguments.next() else {
-            eprintln!("usage: daimon-local-model [--check | --describe-providers] CONFIG.json");
-            return ExitCode::from(2);
+    let (check, describe, supervised, path) =
+        if first == "--check" || first == "--describe-providers" || first == "--supervised" {
+            let Some(path) = arguments.next() else {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            };
+            (
+                first == "--check",
+                first == "--describe-providers",
+                first == "--supervised",
+                path,
+            )
+        } else {
+            (false, false, false, first)
         };
-        (first == "--check", first == "--describe-providers", path)
-    } else {
-        (false, false, first)
-    };
     if arguments.next().is_some() {
-        eprintln!("usage: daimon-local-model [--check | --describe-providers] CONFIG.json");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
     if describe {
@@ -42,7 +51,12 @@ fn main() -> ExitCode {
         println!("local model configuration valid");
         return ExitCode::SUCCESS;
     }
-    match daimon_local_model::run(config) {
+    let result = if supervised {
+        daimon_local_model::run_supervised(config, io::stdin())
+    } else {
+        daimon_local_model::run(config)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("local model daemon: {error}");
