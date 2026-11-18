@@ -296,6 +296,12 @@ make qualify-openai-live DAIMON_OPENAI_LIVE_MODEL=gemma3:27b
 The gate performs one bounded OpenAI-compatible request without retry and
 requires attributed nonempty output plus provider-reported token usage. It does
 not download a model or treat generated text as an Agora/Vellum receipt.
+For an explicitly authorized developer dogfood review, set
+`DAIMON_OPENAI_LIVE_PROMPT_FILE` to a nonempty prompt of at most 64 KiB. The
+same gate substitutes those bytes for its fixed qualification question and
+prints the attributed model output. This is a bounded provider-adapter probe,
+not a governed Pantheon work invocation, role activation, delegation receipt,
+or substitute for human review.
 
 For live Dendrite grounding, start from
 `config/local-model-dendrite.example.json`, replace both retained `sha256:`

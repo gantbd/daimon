@@ -6,6 +6,7 @@ use daimon_openai_local::{
 use daimon_protocol as protocol;
 use serde_json::json;
 use std::{
+    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::mpsc,
@@ -164,7 +165,18 @@ fn live_loopback_provider_returns_attributed_bounded_completion() {
     profile.endpoint.max_response_bytes = 1024 * 1024;
     profile.snapshot.document_digest =
         profile_document_digest(&profile.snapshot, &profile.endpoint);
-    let invocation = invocation(profile.snapshot.clone());
+    let mut invocation = invocation(profile.snapshot.clone());
+    let delegated_prompt = std::env::var_os("DAIMON_OPENAI_LIVE_PROMPT_FILE").map(|path| {
+        let metadata = fs::metadata(&path).expect("live prompt file metadata");
+        assert!(metadata.len() <= 64 * 1024, "live prompt exceeds 64 KiB");
+        let prompt = fs::read(path).expect("read live prompt file");
+        assert!(!prompt.is_empty(), "live prompt must not be empty");
+        prompt
+    });
+    if let Some(prompt) = delegated_prompt.as_ref() {
+        invocation.messages[0].content = prompt.clone();
+        invocation.estimated_input_tokens = prompt.len().div_ceil(4) as u64;
+    }
     let mut provider = OpenAiCompatibleProvider::try_new(&[profile]).unwrap();
 
     let ModelProviderOutcomeV1::Receipt(receipt) = provider.execute_model(&invocation) else {
@@ -179,6 +191,12 @@ fn live_loopback_provider_returns_attributed_bounded_completion() {
         invocation.provider.document_digest
     );
     assert_eq!(receipt.evidence_digest, evidence_digest(&invocation));
+    if delegated_prompt.is_some() {
+        println!(
+            "DAIMON_DELEGATED_OUTPUT={}",
+            String::from_utf8_lossy(&receipt.output)
+        );
+    }
 }
 
 #[test]
