@@ -32,10 +32,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     ffi::OsString,
-    fs,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     net::Shutdown,
-    os::unix::net::UnixStream,
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        net::UnixStream,
+    },
     path::{Component, Path, PathBuf},
     rc::Rc,
     sync::{
@@ -46,7 +49,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigV1 {
     pub principal: String,
@@ -78,7 +81,7 @@ pub struct ConfigV1 {
     pub max_context_bytes: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfigV1 {
     pub provider_id: String,
@@ -96,7 +99,7 @@ pub struct ProviderConfigV1 {
     pub transport: TransportConfigV1,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IsolationConfigV1 {
     #[default]
@@ -107,14 +110,14 @@ pub enum IsolationConfigV1 {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportConfigV1 {
     Acp,
     ClaudeStreamJson,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfigV1 {
     pub identity: String,
@@ -125,7 +128,7 @@ pub struct WorkspaceConfigV1 {
     pub acp_terminal: Option<AcpTerminalConfigV1>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpFileReadConfigV1 {
     /// Daimon tool capability required in both open and callback executions.
@@ -137,7 +140,7 @@ pub struct AcpFileReadConfigV1 {
     pub max_bytes: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpTerminalConfigV1 {
     pub capability: String,
@@ -154,7 +157,7 @@ pub struct AcpTerminalConfigV1 {
     pub max_output_bytes: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpTerminalCommandConfigV1 {
     pub command: String,
@@ -163,14 +166,14 @@ pub struct AcpTerminalCommandConfigV1 {
     pub argument_prefix: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskBindingConfigV1 {
     pub external_task_key: String,
     pub chronos_task_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextConfigV1 {
     pub reference: String,
@@ -180,7 +183,7 @@ pub struct ContextConfigV1 {
     pub grounding: Option<GroundingConfigV1>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextKindConfigV1 {
     AgoraMessage,
@@ -188,7 +191,7 @@ pub enum ContextKindConfigV1 {
     VellumDocument,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroundingConfigV1 {
     pub depth: GroundingDepthConfigV1,
@@ -196,7 +199,7 @@ pub struct GroundingConfigV1 {
     pub surface_digest: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroundingDepthConfigV1 {
     Ambient,
@@ -300,6 +303,438 @@ fn digest_text(bytes: [u8; 32]) -> String {
         let _ = write!(text, "{byte:02x}");
     }
     text
+}
+
+const MAX_OWNER_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum ProviderEditErrorV1 {
+    Io,
+    Json,
+    Invalid,
+    Conflict,
+    PlanMismatch,
+    Busy,
+}
+
+impl std::fmt::Display for ProviderEditErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let orientation = match self {
+            Self::Io => "owner document could not be read or replaced",
+            Self::Json => "request or owner document is not valid JSON",
+            Self::Invalid => "request or candidate owner document is invalid",
+            Self::Conflict => "owner document changed; refresh and review a new plan",
+            Self::PlanMismatch => "confirmation does not match the reviewed plan",
+            Self::Busy => "another provider edit is in progress; try again after it completes",
+        };
+        write!(formatter, "provider edit: {orientation}")
+    }
+}
+
+impl std::error::Error for ProviderEditErrorV1 {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderEditPlanRequestV1 {
+    version: u8,
+    operation_id: String,
+    expected_document_digest: String,
+    provider: ProviderConfigV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderEditApplyRequestV1 {
+    version: u8,
+    operation_id: String,
+    expected_document_digest: String,
+    expected_plan_digest: String,
+    expected_candidate_document_digest: String,
+    provider: ProviderConfigV1,
+}
+
+#[derive(Serialize)]
+struct ProviderEditPlanV1 {
+    version: u8,
+    owner: &'static str,
+    operation_id: String,
+    action: &'static str,
+    expected_document_digest: String,
+    current_document_digest: String,
+    candidate_document_digest: String,
+    plan_digest: String,
+    provider: ProviderEditProjectionV1,
+    changed_fields: Vec<&'static str>,
+    restart_required: bool,
+}
+
+#[derive(Serialize)]
+struct ProviderEditProjectionV1 {
+    provider_id: String,
+    harness_profile_id: String,
+    policy_digest: String,
+    profile_document_digest: String,
+    transport: &'static str,
+    isolation: &'static str,
+    executable_available: bool,
+    argument_count: usize,
+    inherited_environment_name_count: usize,
+    authentication_method_configured: bool,
+}
+
+#[derive(Serialize)]
+struct ProviderEditReceiptV1 {
+    version: u8,
+    owner: &'static str,
+    operation_id: String,
+    disposition: &'static str,
+    applied: bool,
+    replayed: bool,
+    document_digest: String,
+    provider_id: String,
+    restart_required: bool,
+}
+
+/// Produces the exact, redacted change plan which must be confirmed before an
+/// owner document can be replaced. Launch material never appears in the plan.
+pub fn plan_provider_edit_json(
+    path: impl AsRef<Path>,
+    request: &[u8],
+) -> Result<String, ProviderEditErrorV1> {
+    let request: ProviderEditPlanRequestV1 =
+        serde_json::from_slice(request).map_err(|_| ProviderEditErrorV1::Json)?;
+    validate_edit_header(
+        request.version,
+        &request.operation_id,
+        &request.expected_document_digest,
+    )?;
+    let path = path.as_ref();
+    let (bytes, current) = read_owner_document(path)?;
+    let current_digest = digest_text(Sha256::digest(&bytes).into());
+    if current_digest != request.expected_document_digest {
+        return Err(ProviderEditErrorV1::Conflict);
+    }
+    let existing = current
+        .providers
+        .iter()
+        .find(|provider| provider.provider_id == request.provider.provider_id)
+        .cloned();
+    let (candidate, candidate_bytes) = candidate_document(current, request.provider.clone())?;
+    let candidate_digest = digest_text(Sha256::digest(&candidate_bytes).into());
+    let plan_digest =
+        provider_edit_plan_digest(&request.operation_id, &current_digest, &candidate_digest);
+    let provider = candidate
+        .providers
+        .iter()
+        .find(|provider| provider.provider_id == request.provider.provider_id)
+        .ok_or(ProviderEditErrorV1::Invalid)?;
+    let profile = validate(candidate.clone())
+        .map_err(map_config_edit_error)?
+        .profiles
+        .into_iter()
+        .zip(candidate.providers.iter())
+        .find(|(_, configured)| configured.provider_id == provider.provider_id)
+        .map(|(profile, _)| profile)
+        .ok_or(ProviderEditErrorV1::Invalid)?;
+    serde_json::to_string(&ProviderEditPlanV1 {
+        version: 1,
+        owner: "daimon-local-agent",
+        operation_id: request.operation_id,
+        action: if existing.is_some() { "replace" } else { "add" },
+        expected_document_digest: request.expected_document_digest,
+        current_document_digest: current_digest,
+        candidate_document_digest: candidate_digest,
+        plan_digest,
+        provider: provider_edit_projection(provider, profile.document_digest.into_bytes()),
+        changed_fields: changed_provider_fields(existing.as_ref(), provider),
+        restart_required: true,
+    })
+    .map_err(|_| ProviderEditErrorV1::Json)
+}
+
+/// Applies only the byte-exact candidate previously planned by this owner.
+/// Replaying the same confirmed operation is successful without rewriting.
+pub fn apply_provider_edit_json(
+    path: impl AsRef<Path>,
+    request: &[u8],
+) -> Result<String, ProviderEditErrorV1> {
+    let request: ProviderEditApplyRequestV1 =
+        serde_json::from_slice(request).map_err(|_| ProviderEditErrorV1::Json)?;
+    validate_edit_header(
+        request.version,
+        &request.operation_id,
+        &request.expected_document_digest,
+    )?;
+    validate_digest(&request.expected_plan_digest)?;
+    validate_digest(&request.expected_candidate_document_digest)?;
+    let calculated_plan = provider_edit_plan_digest(
+        &request.operation_id,
+        &request.expected_document_digest,
+        &request.expected_candidate_document_digest,
+    );
+    if calculated_plan != request.expected_plan_digest {
+        return Err(ProviderEditErrorV1::PlanMismatch);
+    }
+
+    let path = path.as_ref();
+    let _lock = EditLockV1::acquire(path, &request.operation_id)?;
+    let (bytes, current) = read_owner_document(path)?;
+    let current_digest = digest_text(Sha256::digest(&bytes).into());
+    if current_digest == request.expected_candidate_document_digest {
+        let provider_matches = current
+            .providers
+            .iter()
+            .any(|provider| provider == &request.provider);
+        if !provider_matches {
+            return Err(ProviderEditErrorV1::PlanMismatch);
+        }
+        return provider_edit_receipt(&request, true);
+    }
+    if current_digest != request.expected_document_digest {
+        return Err(ProviderEditErrorV1::Conflict);
+    }
+    let (_, candidate_bytes) = candidate_document(current, request.provider.clone())?;
+    let candidate_digest = digest_text(Sha256::digest(&candidate_bytes).into());
+    if candidate_digest != request.expected_candidate_document_digest {
+        return Err(ProviderEditErrorV1::PlanMismatch);
+    }
+    atomic_replace_owner_document(path, &request.operation_id, &candidate_bytes)?;
+    provider_edit_receipt(&request, false)
+}
+
+fn provider_edit_receipt(
+    request: &ProviderEditApplyRequestV1,
+    replayed: bool,
+) -> Result<String, ProviderEditErrorV1> {
+    serde_json::to_string(&ProviderEditReceiptV1 {
+        version: 1,
+        owner: "daimon-local-agent",
+        operation_id: request.operation_id.clone(),
+        disposition: if replayed {
+            "already_applied"
+        } else {
+            "applied"
+        },
+        applied: true,
+        replayed,
+        document_digest: request.expected_candidate_document_digest.clone(),
+        provider_id: request.provider.provider_id.clone(),
+        restart_required: true,
+    })
+    .map_err(|_| ProviderEditErrorV1::Json)
+}
+
+fn validate_edit_header(
+    version: u8,
+    operation_id: &str,
+    document_digest: &str,
+) -> Result<(), ProviderEditErrorV1> {
+    if version != 1
+        || operation_id.len() != 32
+        || !operation_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ProviderEditErrorV1::Invalid);
+    }
+    validate_digest(document_digest)
+}
+
+fn validate_digest(digest: &str) -> Result<(), ProviderEditErrorV1> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(ProviderEditErrorV1::Invalid);
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ProviderEditErrorV1::Invalid);
+    }
+    Ok(())
+}
+
+fn read_owner_document(path: &Path) -> Result<(Vec<u8>, ConfigV1), ProviderEditErrorV1> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| ProviderEditErrorV1::Io)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_OWNER_DOCUMENT_BYTES
+    {
+        return Err(ProviderEditErrorV1::Invalid);
+    }
+    let bytes = fs::read(path).map_err(|_| ProviderEditErrorV1::Io)?;
+    let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ProviderEditErrorV1::Json)?;
+    validate(raw.clone()).map_err(map_config_edit_error)?;
+    Ok((bytes, raw))
+}
+
+fn candidate_document(
+    mut current: ConfigV1,
+    provider: ProviderConfigV1,
+) -> Result<(ConfigV1, Vec<u8>), ProviderEditErrorV1> {
+    if let Some(existing) = current
+        .providers
+        .iter_mut()
+        .find(|existing| existing.provider_id == provider.provider_id)
+    {
+        *existing = provider;
+    } else {
+        current.providers.push(provider);
+    }
+    validate(current.clone()).map_err(map_config_edit_error)?;
+    let mut bytes = serde_json::to_vec_pretty(&current).map_err(|_| ProviderEditErrorV1::Json)?;
+    bytes.push(b'\n');
+    Ok((current, bytes))
+}
+
+fn provider_edit_plan_digest(operation_id: &str, current: &str, candidate: &str) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        b"daimon-local-agent/provider-edit/v1".as_slice(),
+        operation_id.as_bytes(),
+        current.as_bytes(),
+        candidate.as_bytes(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    digest_text(hasher.finalize().into())
+}
+
+fn changed_provider_fields(
+    existing: Option<&ProviderConfigV1>,
+    candidate: &ProviderConfigV1,
+) -> Vec<&'static str> {
+    let Some(existing) = existing else {
+        return vec!["provider_added"];
+    };
+    let mut fields = Vec::new();
+    if existing.harness_profile_id != candidate.harness_profile_id {
+        fields.push("harness_profile_id");
+    }
+    if existing.policy_digest != candidate.policy_digest {
+        fields.push("policy_digest");
+    }
+    if existing.program != candidate.program {
+        fields.push("program");
+    }
+    if existing.arguments != candidate.arguments {
+        fields.push("arguments");
+    }
+    if existing.inherited_environment_names != candidate.inherited_environment_names {
+        fields.push("inherited_environment_names");
+    }
+    if existing.acp_agent_authentication_method != candidate.acp_agent_authentication_method {
+        fields.push("authentication_method");
+    }
+    if existing.isolation != candidate.isolation {
+        fields.push("isolation");
+    }
+    if existing.transport != candidate.transport {
+        fields.push("transport");
+    }
+    fields
+}
+
+fn provider_edit_projection(
+    provider: &ProviderConfigV1,
+    profile_document_digest: [u8; 32],
+) -> ProviderEditProjectionV1 {
+    ProviderEditProjectionV1 {
+        provider_id: provider.provider_id.clone(),
+        harness_profile_id: provider.harness_profile_id.clone(),
+        policy_digest: provider.policy_digest.clone(),
+        profile_document_digest: digest_text(profile_document_digest),
+        transport: match provider.transport {
+            TransportConfigV1::Acp => "acp",
+            TransportConfigV1::ClaudeStreamJson => "claude_stream_json",
+        },
+        isolation: match provider.isolation {
+            IsolationConfigV1::Direct => "direct",
+            IsolationConfigV1::MacosSeatbelt { .. } => "macos_seatbelt",
+        },
+        executable_available: provider.program.is_file(),
+        argument_count: provider.arguments.len(),
+        inherited_environment_name_count: provider.inherited_environment_names.len(),
+        authentication_method_configured: provider.acp_agent_authentication_method.is_some(),
+    }
+}
+
+fn map_config_edit_error(error: ConfigErrorV1) -> ProviderEditErrorV1 {
+    match error {
+        ConfigErrorV1::Io => ProviderEditErrorV1::Io,
+        ConfigErrorV1::Json => ProviderEditErrorV1::Json,
+        ConfigErrorV1::Invalid => ProviderEditErrorV1::Invalid,
+    }
+}
+
+struct EditLockV1 {
+    path: PathBuf,
+}
+
+impl EditLockV1 {
+    fn acquire(path: &Path, operation_id: &str) -> Result<Self, ProviderEditErrorV1> {
+        let lock_path = sibling_path(path, ".provider-edit.lock")?;
+        let mut lock = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock_path)
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ProviderEditErrorV1::Busy);
+            }
+            Err(_) => return Err(ProviderEditErrorV1::Io),
+        };
+        if lock.write_all(operation_id.as_bytes()).is_err() || lock.sync_all().is_err() {
+            let _ = fs::remove_file(&lock_path);
+            return Err(ProviderEditErrorV1::Io);
+        }
+        Ok(Self { path: lock_path })
+    }
+}
+
+impl Drop for EditLockV1 {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf, ProviderEditErrorV1> {
+    let name = path.file_name().ok_or(ProviderEditErrorV1::Invalid)?;
+    let mut sibling = OsString::from(name);
+    sibling.push(suffix);
+    Ok(path.with_file_name(sibling))
+}
+
+fn atomic_replace_owner_document(
+    path: &Path,
+    operation_id: &str,
+    bytes: &[u8],
+) -> Result<(), ProviderEditErrorV1> {
+    let temporary_path = sibling_path(path, &format!(".provider-edit-{operation_id}.tmp"))?;
+    let permissions = fs::metadata(path)
+        .map_err(|_| ProviderEditErrorV1::Io)?
+        .permissions()
+        .mode();
+    let result = (|| {
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(permissions)
+            .open(&temporary_path)
+            .map_err(|_| ProviderEditErrorV1::Io)?;
+        temporary
+            .write_all(bytes)
+            .map_err(|_| ProviderEditErrorV1::Io)?;
+        temporary.sync_all().map_err(|_| ProviderEditErrorV1::Io)?;
+        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(permissions))
+            .map_err(|_| ProviderEditErrorV1::Io)?;
+        fs::rename(&temporary_path, path).map_err(|_| ProviderEditErrorV1::Io)?;
+        let parent = path.parent().ok_or(ProviderEditErrorV1::Invalid)?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ProviderEditErrorV1::Io)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 #[derive(Clone)]

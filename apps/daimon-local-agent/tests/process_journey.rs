@@ -364,6 +364,112 @@ fn executable_projects_validated_provider_catalog_without_launch_material() {
     assert!(!projection.contains("arguments"));
 }
 
+#[test]
+fn executable_plans_applies_and_replays_guarded_provider_edit() {
+    let _journey = PROCESS_JOURNEY.lock().unwrap();
+    let fixture = Fixture::new();
+    write_config(&fixture);
+    let catalog_output = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
+        .arg("--describe-providers")
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert!(catalog_output.status.success());
+    let catalog: serde_json::Value = serde_json::from_slice(&catalog_output.stdout).unwrap();
+    let original_digest = catalog["document_digest"].as_str().unwrap();
+    let owner_document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.config).unwrap()).unwrap();
+    let mut provider = owner_document["providers"][0].clone();
+    provider["policy_digest"] = serde_json::Value::String(format!("sha256:{}", "77".repeat(32)));
+    let operation_id = "abababababababababababababababab";
+    let plan_request = serde_json::json!({
+        "version": 1,
+        "operation_id": operation_id,
+        "expected_document_digest": original_digest,
+        "provider": provider
+    });
+    let plan_output = run_provider_edit(&fixture, "--plan-provider-edit", &plan_request);
+    assert!(plan_output.status.success(), "{:?}", plan_output.stderr);
+    let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).unwrap();
+    assert_eq!(plan["owner"], "daimon-local-agent");
+    assert_eq!(plan["action"], "replace");
+    assert_eq!(plan["changed_fields"], serde_json::json!(["policy_digest"]));
+    assert_eq!(plan["restart_required"], true);
+    let projection = String::from_utf8(plan_output.stdout).unwrap();
+    assert!(!projection.contains("/bin/sh"));
+    assert!(!projection.contains(fixture.root.to_str().unwrap()));
+    assert!(!projection.contains("fake_acp_agent"));
+
+    let apply_request = serde_json::json!({
+        "version": 1,
+        "operation_id": operation_id,
+        "expected_document_digest": original_digest,
+        "expected_plan_digest": plan["plan_digest"],
+        "expected_candidate_document_digest": plan["candidate_document_digest"],
+        "provider": plan_request["provider"]
+    });
+    let apply_output = run_provider_edit(&fixture, "--apply-provider-edit", &apply_request);
+    assert!(apply_output.status.success(), "{:?}", apply_output.stderr);
+    let receipt: serde_json::Value = serde_json::from_slice(&apply_output.stdout).unwrap();
+    assert_eq!(receipt["disposition"], "applied");
+    assert_eq!(receipt["replayed"], false);
+    assert_eq!(
+        receipt["document_digest"],
+        plan["candidate_document_digest"]
+    );
+
+    let replay_output = run_provider_edit(&fixture, "--apply-provider-edit", &apply_request);
+    assert!(replay_output.status.success(), "{:?}", replay_output.stderr);
+    let replay: serde_json::Value = serde_json::from_slice(&replay_output.stdout).unwrap();
+    assert_eq!(replay["disposition"], "already_applied");
+    assert_eq!(replay["replayed"], true);
+
+    let stale_output = run_provider_edit(&fixture, "--plan-provider-edit", &plan_request);
+    assert!(!stale_output.status.success());
+    assert!(
+        String::from_utf8(stale_output.stderr)
+            .unwrap()
+            .contains("changed; refresh")
+    );
+    let final_catalog_output = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
+        .arg("--describe-providers")
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    let final_catalog: serde_json::Value =
+        serde_json::from_slice(&final_catalog_output.stdout).unwrap();
+    assert_eq!(
+        final_catalog["document_digest"],
+        plan["candidate_document_digest"]
+    );
+    assert_eq!(
+        final_catalog["providers"][0]["policy_digest"],
+        format!("sha256:{}", "77".repeat(32))
+    );
+}
+
+fn run_provider_edit(
+    fixture: &Fixture,
+    command: &str,
+    request: &serde_json::Value,
+) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
+        .arg(command)
+        .arg(&fixture.config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(request).unwrap())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn start_agent(fixture: &Fixture) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
         .arg("--supervised")
