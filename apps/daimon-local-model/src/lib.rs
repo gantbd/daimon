@@ -202,6 +202,24 @@ struct ProviderCatalogV1<'a> {
     owner: &'static str,
     document_digest: String,
     providers: [ProviderCatalogEntryV1<'a>; 1],
+    task_bindings: Vec<TaskBindingCatalogEntryV1<'a>>,
+    contexts: Vec<ContextCatalogEntryV1<'a>>,
+}
+
+#[derive(Serialize)]
+struct TaskBindingCatalogEntryV1<'a> {
+    external_task_key: &'a str,
+    chronos_task_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct ContextCatalogEntryV1<'a> {
+    reference: &'a str,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -255,6 +273,35 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
             sampling_temperature_milli: validated.raw.provider.sampling_temperature_milli,
             bearer_token_configured: validated.raw.provider.bearer_token_env.is_some(),
         }],
+        task_bindings: validated
+            .raw
+            .task_bindings
+            .iter()
+            .map(|binding| TaskBindingCatalogEntryV1 {
+                external_task_key: &binding.external_task_key,
+                chronos_task_id: &binding.chronos_task_id,
+            })
+            .collect(),
+        contexts: validated
+            .raw
+            .context
+            .iter()
+            .map(|context| ContextCatalogEntryV1 {
+                reference: &context.reference,
+                kind: match (context.kind, context.dendrite.as_ref()) {
+                    (_, Some(_)) => "dendrite_grounding",
+                    (Some(ContextKindConfigV1::AgoraMessage), None) => "agora_message",
+                    (Some(ContextKindConfigV1::ChronosWork), None) => "chronos_work",
+                    (Some(ContextKindConfigV1::VellumDocument), None) => "vellum_document",
+                    (None, None) => "unknown",
+                },
+                source_digest: context
+                    .text
+                    .as_ref()
+                    .map(|text| digest_text(Sha256::digest(text.as_bytes()).into())),
+                bytes: context.text.as_ref().map(String::len),
+            })
+            .collect(),
     })
     .map_err(|_| ConfigErrorV1::Json)
 }

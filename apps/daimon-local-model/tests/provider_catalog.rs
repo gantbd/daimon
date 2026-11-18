@@ -69,6 +69,22 @@ fn executable_projects_validated_local_model_without_endpoint_secrets() {
     assert_eq!(catalog["providers"][0]["endpoint_scope"], "loopback");
     assert_eq!(catalog["providers"][0]["endpoint_port"], 1234);
     assert_eq!(catalog["providers"][0]["structured_tools"], true);
+    assert_eq!(
+        catalog["task_bindings"],
+        serde_json::json!([{
+            "external_task_key": "04040404040404040404040404040404",
+            "chronos_task_id": "catalog-task"
+        }])
+    );
+    assert_eq!(catalog["contexts"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["contexts"][0]["kind"], "chronos_work");
+    assert_eq!(catalog["contexts"][0]["bytes"], 12);
+    assert!(
+        catalog["contexts"][0]["source_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     let projection = String::from_utf8(output.stdout).unwrap();
     assert!(!projection.contains("host_header"));
     assert!(!projection.contains("/v1/chat/completions"));

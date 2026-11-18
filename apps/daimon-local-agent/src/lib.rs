@@ -239,6 +239,22 @@ struct ProviderCatalogV1<'a> {
     owner: &'static str,
     document_digest: String,
     providers: Vec<ProviderCatalogEntryV1<'a>>,
+    task_bindings: Vec<TaskBindingCatalogEntryV1<'a>>,
+    contexts: Vec<ContextCatalogEntryV1<'a>>,
+}
+
+#[derive(Serialize)]
+struct TaskBindingCatalogEntryV1<'a> {
+    external_task_key: &'a str,
+    chronos_task_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct ContextCatalogEntryV1<'a> {
+    reference: &'a str,
+    kind: &'static str,
+    source_digest: String,
+    bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -286,11 +302,37 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
             authentication_method_configured: provider.acp_agent_authentication_method.is_some(),
         })
         .collect();
+    let task_bindings = validated
+        .raw
+        .task_bindings
+        .iter()
+        .map(|binding| TaskBindingCatalogEntryV1 {
+            external_task_key: &binding.external_task_key,
+            chronos_task_id: &binding.chronos_task_id,
+        })
+        .collect();
+    let contexts = validated
+        .raw
+        .context
+        .iter()
+        .map(|context| ContextCatalogEntryV1 {
+            reference: &context.reference,
+            kind: match context.kind {
+                ContextKindConfigV1::AgoraMessage => "agora_message",
+                ContextKindConfigV1::ChronosWork => "chronos_work",
+                ContextKindConfigV1::VellumDocument => "vellum_document",
+            },
+            source_digest: digest_text(Sha256::digest(context.text.as_bytes()).into()),
+            bytes: context.text.len(),
+        })
+        .collect();
     serde_json::to_string(&ProviderCatalogV1 {
         version: 1,
         owner: "daimon-local-agent",
         document_digest: digest_text(Sha256::digest(&bytes).into()),
         providers,
+        task_bindings,
+        contexts,
     })
     .map_err(|_| ConfigErrorV1::Json)
 }

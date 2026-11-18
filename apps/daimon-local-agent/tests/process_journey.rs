@@ -357,6 +357,14 @@ fn executable_projects_validated_provider_catalog_without_launch_material() {
     assert_eq!(catalog["providers"].as_array().unwrap().len(), 1);
     assert_eq!(catalog["providers"][0]["transport"], "acp");
     assert_eq!(catalog["providers"][0]["executable_available"], true);
+    assert_eq!(
+        catalog["task_bindings"],
+        serde_json::json!([{
+            "external_task_key": "07070707070707070707070707070707",
+            "chronos_task_id": "local-agent-task"
+        }])
+    );
+    assert_eq!(catalog["contexts"], serde_json::json!([]));
     let projection = String::from_utf8(output.stdout).unwrap();
     assert!(!projection.contains("/bin/sh"));
     assert!(!projection.contains(fixture.root.to_str().unwrap()));
