@@ -48,6 +48,12 @@ use std::{
     thread,
     time::Duration,
 };
+use vellum_adapter_local_authentication::{LocalCredentialClaimProviderV1, LocalCredentialStoreV1};
+use vellum_sdk_client::{
+    protocol::{SnapshotV1, WorkspaceDocumentIdV1, WorkspaceIdV1},
+    transport::{AuthenticatedUnixConnector, RemoteTransport, TransportLimits},
+    workspace::WorkspaceClientV1,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +73,8 @@ pub struct ConfigV1 {
     pub tool_capabilities: Vec<String>,
     #[serde(default)]
     pub context: Vec<ContextConfigV1>,
+    #[serde(default)]
+    pub vellum_context: Vec<VellumContextConfigV1>,
     #[serde(default = "default_io_timeout_ms")]
     pub io_timeout_ms: u64,
     #[serde(default = "default_max_agent_sessions")]
@@ -183,6 +191,17 @@ pub struct ContextConfigV1 {
     pub grounding: Option<GroundingConfigV1>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VellumContextConfigV1 {
+    pub reference: String,
+    pub socket: PathBuf,
+    pub credential: PathBuf,
+    pub workspace_id: u64,
+    pub document_ordinal: u64,
+    pub expected_revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextKindConfigV1 {
@@ -228,7 +247,7 @@ pub struct ValidatedConfigV1 {
     profiles: Vec<AgentProfileSnapshotV1>,
     bindings: Vec<TaskBindingV1>,
     tools: Vec<[u8; 16]>,
-    context: StaticAgentContext,
+    context: AgentContext,
     file_read_scopes: Vec<AgentFileReadScopeV1>,
     terminal_scopes: Vec<AgentTerminalScopeV1>,
 }
@@ -253,8 +272,17 @@ struct TaskBindingCatalogEntryV1<'a> {
 struct ContextCatalogEntryV1<'a> {
     reference: &'a str,
     kind: &'static str,
-    source_digest: String,
-    bytes: usize,
+    resolution: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -322,9 +350,29 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
                 ContextKindConfigV1::ChronosWork => "chronos_work",
                 ContextKindConfigV1::VellumDocument => "vellum_document",
             },
-            source_digest: digest_text(Sha256::digest(context.text.as_bytes()).into()),
-            bytes: context.text.len(),
+            resolution: "static_owner_document",
+            source_digest: Some(digest_text(Sha256::digest(context.text.as_bytes()).into())),
+            bytes: Some(context.text.len()),
+            workspace_id: None,
+            document_ordinal: None,
+            expected_revision: None,
         })
+        .chain(
+            validated
+                .raw
+                .vellum_context
+                .iter()
+                .map(|context| ContextCatalogEntryV1 {
+                    reference: &context.reference,
+                    kind: "vellum_document",
+                    resolution: "runtime_owner",
+                    source_digest: None,
+                    bytes: None,
+                    workspace_id: Some(context.workspace_id),
+                    document_ordinal: Some(context.document_ordinal),
+                    expected_revision: Some(context.expected_revision),
+                }),
+        )
         .collect();
     serde_json::to_string(&ProviderCatalogV1 {
         version: 1,
@@ -882,7 +930,12 @@ pub fn validate(raw: ConfigV1) -> Result<ValidatedConfigV1, ConfigErrorV1> {
     }
     let file_read_scopes = validate_file_read_scopes(&raw.workspaces, &tools)?;
     let terminal_scopes = validate_terminal_scopes(&raw.workspaces, &tools)?;
-    let context = StaticAgentContext::try_new(&raw.context, raw.max_context_bytes)?;
+    let context = AgentContext::try_new(
+        &raw.context,
+        &raw.vellum_context,
+        raw.max_context_bytes,
+        Duration::from_millis(raw.io_timeout_ms),
+    )?;
     Ok(ValidatedConfigV1 {
         raw,
         principal,
@@ -1941,16 +1994,39 @@ fn build_provider_router(
         .map_err(|_| ConfigErrorV1::Invalid)
 }
 
-struct StaticAgentContext {
-    evidence: BTreeMap<protocol::ContextReferenceIdV1, protocol::ContextEvidenceV1>,
-    max_bytes: usize,
+enum AgentContextBinding {
+    Static(protocol::ContextEvidenceV1),
+    Vellum(VellumContextBinding),
 }
 
-impl StaticAgentContext {
-    fn try_new(config: &[ContextConfigV1], max_bytes: usize) -> Result<Self, ConfigErrorV1> {
-        let mut evidence = BTreeMap::new();
+#[derive(Clone)]
+struct VellumContextBinding {
+    socket: PathBuf,
+    credential: PathBuf,
+    workspace_id: u64,
+    document_ordinal: u64,
+    expected_revision: u64,
+}
+
+struct AgentContext {
+    bindings: BTreeMap<protocol::ContextReferenceIdV1, AgentContextBinding>,
+    max_bytes: usize,
+    timeout: Duration,
+}
+
+impl AgentContext {
+    fn try_new(
+        config: &[ContextConfigV1],
+        vellum: &[VellumContextConfigV1],
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Self, ConfigErrorV1> {
+        let mut bindings = BTreeMap::new();
         for item in config {
             let reference = protocol::ContextReferenceIdV1::new(hex_id(&item.reference)?);
+            if matches!(item.kind, ContextKindConfigV1::VellumDocument) {
+                return Err(ConfigErrorV1::Invalid);
+            }
             let bytes = item.text.as_bytes().to_vec();
             if bytes.is_empty() || bytes.len() > max_bytes {
                 return Err(ConfigErrorV1::Invalid);
@@ -1985,33 +2061,110 @@ impl StaticAgentContext {
                 bytes,
                 grounding,
             };
-            if evidence.insert(reference, value).is_some() {
+            if bindings
+                .insert(reference, AgentContextBinding::Static(value))
+                .is_some()
+            {
+                return Err(ConfigErrorV1::Invalid);
+            }
+        }
+        for item in vellum {
+            if !item.socket.is_absolute()
+                || !item.credential.is_absolute()
+                || item.workspace_id == 0
+                || item.document_ordinal == 0
+            {
+                return Err(ConfigErrorV1::Invalid);
+            }
+            let reference = protocol::ContextReferenceIdV1::new(hex_id(&item.reference)?);
+            if bindings
+                .insert(
+                    reference,
+                    AgentContextBinding::Vellum(VellumContextBinding {
+                        socket: item.socket.clone(),
+                        credential: item.credential.clone(),
+                        workspace_id: item.workspace_id,
+                        document_ordinal: item.document_ordinal,
+                        expected_revision: item.expected_revision,
+                    }),
+                )
+                .is_some()
+            {
                 return Err(ConfigErrorV1::Invalid);
             }
         }
         Ok(Self {
-            evidence,
+            bindings,
             max_bytes,
+            timeout,
         })
     }
 
-    fn select(
+    fn resolve_vellum(
         &self,
+        reference: protocol::ContextReferenceIdV1,
+        binding: &VellumContextBinding,
+    ) -> Result<protocol::ContextEvidenceV1, ContextRefusalV1> {
+        let record = LocalCredentialStoreV1::default()
+            .load(&binding.credential)
+            .map_err(|_| ContextRefusalV1::Unavailable)?;
+        let connector = AuthenticatedUnixConnector::with_provider_and_timeout(
+            binding.socket.clone(),
+            LocalCredentialClaimProviderV1::new(record),
+            self.timeout,
+        )
+        .map_err(|_| ContextRefusalV1::InvalidEvidence)?;
+        let transport = RemoteTransport::new(connector, TransportLimits::reference())
+            .map_err(|_| ContextRefusalV1::InvalidEvidence)?;
+        let mut client =
+            WorkspaceClientV1::connect(transport).map_err(|_| ContextRefusalV1::Unavailable)?;
+        client
+            .refresh_inventory()
+            .map_err(|_| ContextRefusalV1::Unavailable)?;
+        let workspace =
+            WorkspaceIdV1::new(binding.workspace_id).ok_or(ContextRefusalV1::InvalidEvidence)?;
+        if client.projection().inventory().map(|value| value.workspace) != Some(workspace) {
+            return Err(ContextRefusalV1::Unavailable);
+        }
+        let document = WorkspaceDocumentIdV1::new(workspace, binding.document_ordinal)
+            .ok_or(ContextRefusalV1::InvalidEvidence)?;
+        client
+            .select_document(document)
+            .map_err(|_| ContextRefusalV1::Unavailable)?;
+        client
+            .refresh_snapshot()
+            .map_err(|_| ContextRefusalV1::Unavailable)?;
+        let snapshot = client
+            .projection()
+            .snapshot()
+            .cloned()
+            .ok_or(ContextRefusalV1::Unavailable)?;
+        client
+            .disconnect()
+            .map_err(|_| ContextRefusalV1::Unavailable)?;
+        vellum_evidence(reference, binding, &snapshot, self.max_bytes)
+    }
+
+    fn select(
+        &mut self,
         references: &[protocol::ContextReferenceIdV1],
     ) -> Result<Vec<protocol::ContextEvidenceV1>, ContextRefusalV1> {
         let mut seen = BTreeSet::new();
-        let selected = references
-            .iter()
-            .map(|reference| {
-                if !seen.insert(*reference) {
-                    return Err(ContextRefusalV1::InvalidEvidence);
+        let mut selected = Vec::with_capacity(references.len());
+        for reference in references {
+            if !seen.insert(*reference) {
+                return Err(ContextRefusalV1::InvalidEvidence);
+            }
+            let value = match self.bindings.get(reference) {
+                Some(AgentContextBinding::Static(value)) => value.clone(),
+                Some(AgentContextBinding::Vellum(binding)) => {
+                    let binding = binding.clone();
+                    self.resolve_vellum(*reference, &binding)?
                 }
-                self.evidence
-                    .get(reference)
-                    .cloned()
-                    .ok_or(ContextRefusalV1::Unavailable)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                None => return Err(ContextRefusalV1::Unavailable),
+            };
+            selected.push(value);
+        }
         let total = selected
             .iter()
             .try_fold(0usize, |total, value| total.checked_add(value.bytes.len()));
@@ -2022,7 +2175,29 @@ impl StaticAgentContext {
     }
 }
 
-impl AgentContextAssembler for StaticAgentContext {
+fn vellum_evidence(
+    reference: protocol::ContextReferenceIdV1,
+    binding: &VellumContextBinding,
+    snapshot: &SnapshotV1,
+    max_bytes: usize,
+) -> Result<protocol::ContextEvidenceV1, ContextRefusalV1> {
+    if snapshot.revision != binding.expected_revision {
+        return Err(ContextRefusalV1::InvalidEvidence);
+    }
+    let bytes = snapshot.text.as_bytes().to_vec();
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err(ContextRefusalV1::Limit);
+    }
+    Ok(protocol::ContextEvidenceV1 {
+        reference,
+        kind: protocol::ContextKindV1::VellumDocument,
+        source_digest: protocol::ContentDigestV1::new(Sha256::digest(&bytes).into()),
+        bytes,
+        grounding: None,
+    })
+}
+
+impl AgentContextAssembler for AgentContext {
     fn assemble_agent_context(
         &mut self,
         _service_session: &AuthenticatedSessionV1,
@@ -2319,6 +2494,7 @@ mod tests {
                     surface_digest: format!("sha256:{}", "52".repeat(32)),
                 }),
             }],
+            vellum_context: Vec::new(),
             io_timeout_ms: 1_000,
             max_agent_sessions: 8,
             max_service_sessions: 4,
@@ -2658,7 +2834,13 @@ mod tests {
     #[test]
     fn context_selection_preserves_exact_grounding_and_refuses_aliases() {
         let raw = config();
-        let context = StaticAgentContext::try_new(&raw.context, raw.max_context_bytes).unwrap();
+        let mut context = AgentContext::try_new(
+            &raw.context,
+            &raw.vellum_context,
+            raw.max_context_bytes,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let reference = protocol::ContextReferenceIdV1::new([0x40; 16]);
         let selected = context.select(&[reference]).unwrap();
         assert_eq!(selected[0].bytes, b"exact grounded work");
@@ -2673,6 +2855,73 @@ mod tests {
         assert_eq!(
             context.select(&[protocol::ContextReferenceIdV1::new([0x41; 16])]),
             Err(ContextRefusalV1::Unavailable)
+        );
+    }
+
+    #[test]
+    fn vellum_context_binding_validates_offline_and_refuses_ambiguous_sources() {
+        let mut raw = config();
+        raw.vellum_context.push(VellumContextConfigV1 {
+            reference: "41414141414141414141414141414141".to_owned(),
+            socket: PathBuf::from("/tmp/not-contacted-vellum.sock"),
+            credential: PathBuf::from("/tmp/not-read-vellum.credential"),
+            workspace_id: 7,
+            document_ordinal: 9,
+            expected_revision: 11,
+        });
+        validate(raw.clone()).expect("offline binding validation must not contact Vellum");
+
+        raw.vellum_context[0].reference = raw.context[0].reference.clone();
+        assert!(matches!(validate(raw), Err(ConfigErrorV1::Invalid)));
+
+        let mut copied = config();
+        copied.context[0].kind = ContextKindConfigV1::VellumDocument;
+        assert!(matches!(validate(copied), Err(ConfigErrorV1::Invalid)));
+    }
+
+    #[test]
+    fn vellum_context_binding_requires_exact_nonzero_owner_identity() {
+        let mut raw = config();
+        raw.vellum_context.push(VellumContextConfigV1 {
+            reference: "41414141414141414141414141414141".to_owned(),
+            socket: PathBuf::from("relative.sock"),
+            credential: PathBuf::from("/tmp/vellum.credential"),
+            workspace_id: 1,
+            document_ordinal: 1,
+            expected_revision: 1,
+        });
+        assert!(matches!(validate(raw.clone()), Err(ConfigErrorV1::Invalid)));
+        raw.vellum_context[0].socket = PathBuf::from("/tmp/vellum.sock");
+        raw.vellum_context[0].document_ordinal = 0;
+        assert!(matches!(validate(raw), Err(ConfigErrorV1::Invalid)));
+    }
+
+    #[test]
+    fn vellum_context_accepts_revision_zero_and_refuses_exact_revision_drift() {
+        let reference = protocol::ContextReferenceIdV1::new([0x41; 16]);
+        let mut binding = VellumContextBinding {
+            socket: PathBuf::from("/tmp/vellum.sock"),
+            credential: PathBuf::from("/tmp/vellum.credential"),
+            workspace_id: 1,
+            document_ordinal: 1,
+            expected_revision: 0,
+        };
+        let snapshot = SnapshotV1 {
+            witness: vellum_sdk_client::protocol::VersionWitness::new(1).unwrap(),
+            revision: 0,
+            text: Arc::from("exact Vellum revision"),
+        };
+        let evidence = vellum_evidence(reference, &binding, &snapshot, 4_096).unwrap();
+        assert_eq!(evidence.bytes, b"exact Vellum revision");
+        assert_eq!(
+            evidence.source_digest,
+            protocol::ContentDigestV1::new(Sha256::digest(snapshot.text.as_bytes()).into())
+        );
+
+        binding.expected_revision = 1;
+        assert_eq!(
+            vellum_evidence(reference, &binding, &snapshot, 4_096),
+            Err(ContextRefusalV1::InvalidEvidence)
         );
     }
 }
