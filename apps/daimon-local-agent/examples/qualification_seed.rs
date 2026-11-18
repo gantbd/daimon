@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     principal: protocol::PrincipalIdV1::new([2; 16]),
                     profile: protocol::HarnessProfileIdV1::new([3; 16]),
                     idempotency_key: protocol::IdempotencyKeyV1::new([14; 16]),
-                    context: Vec::new(),
+                    context: vec![protocol::ContextReferenceIdV1::new([8; 16])],
                     tools: Vec::new(),
                     budget: protocol::ExecutionBudgetV1 {
                         max_elapsed_millis: 5_000,

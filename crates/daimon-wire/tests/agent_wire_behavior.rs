@@ -208,6 +208,7 @@ fn session_unknown_and_every_refusal_roundtrip() {
             profile_document_digest: ContentDigestV1::new([9; 32]),
             active_turn: None,
             last_event_cursor: None,
+            last_context: None,
             capabilities: AgentCapabilitiesV1 {
                 resume_session: true,
                 ..AgentCapabilitiesV1::default()
@@ -220,6 +221,17 @@ fn session_unknown_and_every_refusal_roundtrip() {
             profile_document_digest: ContentDigestV1::new([9; 32]),
             active_turn: Some(AgentTurnIdV1::new([11; 16])),
             last_event_cursor: Some(4),
+            last_context: Some(AgentContextReceiptV1 {
+                execution: ExecutionIdV1::new([12; 16]),
+                manifest_digest: ContentDigestV1::new([13; 32]),
+                entries: vec![AgentContextManifestEntryV1 {
+                    reference: ContextReferenceIdV1::new([6; 16]),
+                    kind: ContextKindV1::VellumDocument,
+                    source_digest: ContentDigestV1::new([14; 32]),
+                    content_bytes: 4_096,
+                    grounding: None,
+                }],
+            }),
             capabilities: AgentCapabilitiesV1 {
                 load_session: true,
                 resume_session: true,
@@ -321,5 +333,25 @@ fn independent_prompt_event_and_option_limits_fail_closed() {
     assert_eq!(
         encode_agent_reply(&reply, limits),
         Err(AgentWireCodecErrorV1::Limit)
+    );
+}
+
+#[test]
+fn prior_agent_wire_profile_is_rejected_instead_of_reinterpreted() {
+    let limits = AgentWireLimitsV1::default();
+    let mut encoded = encode_agent_request(
+        &AgentRequestFrameV1 {
+            service_session: SessionHandleV1(1),
+            command: AgentCommandV1::Inspect {
+                session: AgentSessionIdV1::new([8; 16]),
+            },
+        },
+        limits,
+    )
+    .unwrap();
+    encoded[7] = b'1';
+    assert_eq!(
+        decode_agent_request(&encoded, limits),
+        Err(AgentWireCodecErrorV1::Unsupported)
     );
 }

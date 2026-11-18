@@ -69,11 +69,26 @@ fn view(revision: u64, phase: AgentSessionPhaseV1) -> AgentSessionViewV1 {
         profile_document_digest: protocol::ContentDigestV1::new([9; 32]),
         active_turn: None,
         last_event_cursor: Some(2),
+        last_context: Some(context_receipt()),
         capabilities: AgentCapabilitiesV1 {
             permissions: true,
             terminal: true,
             ..AgentCapabilitiesV1::default()
         },
+    }
+}
+
+fn context_receipt() -> AgentContextReceiptV1 {
+    AgentContextReceiptV1 {
+        execution: protocol::ExecutionIdV1::new([24; 16]),
+        manifest_digest: protocol::ContentDigestV1::new([25; 32]),
+        entries: vec![AgentContextManifestEntryV1 {
+            reference: protocol::ContextReferenceIdV1::new([26; 16]),
+            kind: protocol::ContextKindV1::VellumDocument,
+            source_digest: protocol::ContentDigestV1::new([27; 32]),
+            content_bytes: 4_096,
+            grounding: None,
+        }],
     }
 }
 
@@ -117,6 +132,7 @@ fn snapshot() -> AgentServiceSnapshotV1 {
             recovery: Some(daimon_host::agent::AgentProviderRecoveryV1 {
                 locator: b"opaque-provider-session".to_vec(),
             }),
+            last_context: Some(context_receipt()),
             events: vec![
                 AgentEventRecordV1 {
                     cursor: 0,
@@ -240,6 +256,16 @@ fn canonical_agent_snapshot_roundtrips_and_rejects_truncation_or_trailing_bytes(
     let mut trailing = bytes;
     trailing.push(0);
     assert!(decode(&trailing, limits()).is_err());
+}
+
+#[test]
+fn prior_empty_checkpoint_version_remains_decodable_without_context_claims() {
+    let mut bytes = encode(&AgentServiceSnapshotV1::default(), limits()).unwrap();
+    bytes[8] = 1;
+    assert_eq!(
+        decode(&bytes, limits()).unwrap(),
+        AgentServiceSnapshotV1::default()
+    );
 }
 
 #[test]

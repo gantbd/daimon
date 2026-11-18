@@ -17,9 +17,9 @@ use daimon_host::agent::{
 use daimon_host::{AttemptValidator, AuthenticatedSessionV1, ExecutionAuthorizer, StoreCommitV1};
 use daimon_protocol as protocol;
 use daimon_protocol::agent::{
-    AgentCommandV1, AgentEventPageV1, AgentEventRecordV1, AgentEventV1, AgentOpenRequestV1,
-    AgentOutcomeV1, AgentProfileSnapshotV1, AgentRefusalV1, AgentReplyV1, AgentSessionPhaseV1,
-    AgentSessionViewV1, AgentTurnRequestV1,
+    AgentCommandV1, AgentContextManifestEntryV1, AgentContextReceiptV1, AgentEventPageV1,
+    AgentEventRecordV1, AgentEventV1, AgentOpenRequestV1, AgentOutcomeV1, AgentProfileSnapshotV1,
+    AgentRefusalV1, AgentReplyV1, AgentSessionPhaseV1, AgentSessionViewV1, AgentTurnRequestV1,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -101,6 +101,7 @@ struct AgentSessionEntry {
     active_turn: Option<protocol::AgentTurnIdV1>,
     capabilities: protocol::agent::AgentCapabilitiesV1,
     recovery: Option<daimon_host::agent::AgentProviderRecoveryV1>,
+    last_context: Option<AgentContextReceiptV1>,
     events: Vec<AgentEventRecordV1>,
     operations: BTreeMap<protocol::IdempotencyKeyV1, OperationEntry>,
 }
@@ -114,6 +115,7 @@ impl AgentSessionEntry {
             profile_document_digest: self.profile.document_digest,
             active_turn: self.active_turn,
             last_event_cursor: self.events.last().map(|record| record.cursor),
+            last_context: self.last_context.clone(),
             capabilities: self.capabilities,
         }
     }
@@ -376,6 +378,10 @@ where
             Ok(context) => context,
             Err(_) => return refused(AgentRefusalV1::InvalidInput),
         };
+        let context_receipt = match context_admission_receipt(&request.execution, &context) {
+            Ok(receipt) => receipt,
+            Err(refusal) => return refused(refusal),
+        };
         self.agent_sessions.insert(
             request.session,
             AgentSessionEntry {
@@ -387,6 +393,7 @@ where
                 active_turn: None,
                 capabilities: protocol::agent::AgentCapabilitiesV1::default(),
                 recovery: None,
+                last_context: None,
                 events: Vec::new(),
                 operations: BTreeMap::new(),
             },
@@ -403,7 +410,10 @@ where
         else {
             return unknown(request.session, request.execution.idempotency_key);
         };
-        match self.admit_receipt(request.session, ReceiptExpectation::Open, receipt) {
+        match self
+            .admit_receipt(request.session, ReceiptExpectation::Open, receipt)
+            .and_then(|_| self.admit_context_receipt(request.session, context_receipt))
+        {
             Ok(view) if self.persist() => accepted(AgentOutcomeV1::Session(view)),
             Ok(_) => {
                 self.mark_session_unknown(request.session, None);
@@ -490,6 +500,10 @@ where
             };
             (profile, context)
         };
+        let context_receipt = match context_admission_receipt(&request.execution, &context) {
+            Ok(receipt) => receipt,
+            Err(refusal) => return refused(refusal),
+        };
         self.agent_sessions
             .get_mut(&request.session)
             .expect("checked")
@@ -515,11 +529,14 @@ where
         else {
             return unknown(request.session, request.execution.idempotency_key);
         };
-        let view = match self.admit_receipt(
-            request.session,
-            ReceiptExpectation::Turn(request.turn),
-            receipt,
-        ) {
+        let view = match self
+            .admit_receipt(
+                request.session,
+                ReceiptExpectation::Turn(request.turn),
+                receipt,
+            )
+            .and_then(|_| self.admit_context_receipt(request.session, context_receipt))
+        {
             Ok(view) => view,
             Err(refusal) => return refused(refusal),
         };
@@ -618,6 +635,10 @@ where
             };
             (original_open, profile, context)
         };
+        let context_receipt = match context_admission_receipt(&execution, &context) {
+            Ok(receipt) => receipt,
+            Err(refusal) => return refused(refusal),
+        };
         self.agent_sessions
             .get_mut(&session)
             .expect("checked")
@@ -648,7 +669,10 @@ where
             let _ = self.persist();
             return unknown(session, execution.idempotency_key);
         };
-        let view = match self.admit_receipt(session, ReceiptExpectation::Reattach, receipt) {
+        let view = match self
+            .admit_receipt(session, ReceiptExpectation::Reattach, receipt)
+            .and_then(|_| self.admit_context_receipt(session, context_receipt))
+        {
             Ok(view) => view,
             Err(refusal) => return refused(refusal),
         };
@@ -1137,6 +1161,19 @@ where
         Ok(entry.view())
     }
 
+    fn admit_context_receipt(
+        &mut self,
+        session: protocol::AgentSessionIdV1,
+        receipt: AgentContextReceiptV1,
+    ) -> Result<AgentSessionViewV1, AgentRefusalV1> {
+        let entry = self
+            .agent_sessions
+            .get_mut(&session)
+            .ok_or(AgentRefusalV1::UnknownAgentSession)?;
+        entry.last_context = Some(receipt);
+        Ok(entry.view())
+    }
+
     fn persist(&mut self) -> bool {
         let snapshot = self.snapshot();
         matches!(
@@ -1159,6 +1196,7 @@ where
                     active_turn: entry.active_turn,
                     capabilities: entry.capabilities,
                     recovery: entry.recovery.clone(),
+                    last_context: entry.last_context.clone(),
                     events: entry.events.clone(),
                     operations: entry
                         .operations
@@ -1310,6 +1348,7 @@ where
                     active_turn: recovered_active_turn,
                     capabilities: stored.capabilities,
                     recovery: stored.recovery,
+                    last_context: stored.last_context,
                     events: stored.events,
                     operations,
                 },
@@ -1441,6 +1480,9 @@ fn valid_stored_session(stored: &StoredAgentSessionV1) -> bool {
     if permissions > usize::try_from(budget.max_permission_requests).unwrap_or(usize::MAX) {
         return false;
     }
+    if !valid_stored_context_receipts(stored) {
+        return false;
+    }
     if stored.recovery.as_ref().is_some_and(|recovery| {
         recovery.locator.is_empty()
             || recovery.locator.len() > daimon_host::agent::MAX_AGENT_PROVIDER_LOCATOR_BYTES
@@ -1474,6 +1516,42 @@ fn valid_stored_session(stored: &StoredAgentSessionV1) -> bool {
             .unwrap_or(u64::MAX)
     };
     stored.revision == expected_revision
+}
+
+fn valid_stored_context_receipts(stored: &StoredAgentSessionV1) -> bool {
+    let valid = |receipt: &AgentContextReceiptV1| {
+        let execution = if stored.request.execution.execution_id == receipt.execution {
+            Some(&stored.request.execution)
+        } else {
+            stored
+                .operations
+                .iter()
+                .find_map(|operation| match &operation.input {
+                    StoredAgentOperationInputV1::Prompt(request)
+                        if request.execution.execution_id == receipt.execution =>
+                    {
+                        Some(&request.execution)
+                    }
+                    StoredAgentOperationInputV1::Reattach { execution, .. }
+                        if execution.execution_id == receipt.execution =>
+                    {
+                        Some(execution)
+                    }
+                    _ => None,
+                })
+        };
+        execution.is_some_and(|execution| valid_context_receipt(execution, receipt))
+    };
+    stored.last_context.as_ref().is_none_or(valid)
+        && stored
+            .operations
+            .iter()
+            .all(|operation| match &operation.state {
+                StoredAgentOperationStateV1::OutcomeUnknown => true,
+                StoredAgentOperationStateV1::Completed(view) => {
+                    view.last_context.as_ref().is_none_or(valid)
+                }
+            })
 }
 
 fn recovered_phase(stored: &StoredAgentSessionV1) -> AgentSessionPhaseV1 {
@@ -1802,6 +1880,116 @@ fn event_bytes(event: &AgentEventV1) -> usize {
         AgentEventV1::FileChange { path, .. } | AgentEventV1::FileRead { path, .. } => path.len(),
         AgentEventV1::Usage { .. } | AgentEventV1::TurnFinished { .. } => 0,
     }
+}
+
+fn context_admission_receipt(
+    execution: &protocol::ExecuteRequestV1,
+    context: &[protocol::ContextEvidenceV1],
+) -> Result<AgentContextReceiptV1, AgentRefusalV1> {
+    if execution.context.len() != context.len() {
+        return Err(AgentRefusalV1::InvalidInput);
+    }
+    let mut by_reference = BTreeMap::new();
+    for evidence in context {
+        if evidence.bytes.is_empty()
+            || evidence.source_digest.into_bytes() == [0; 32]
+            || (evidence.kind == protocol::ContextKindV1::DendriteGrounding)
+                != evidence.grounding.is_some()
+            || by_reference.insert(evidence.reference, evidence).is_some()
+        {
+            return Err(AgentRefusalV1::InvalidInput);
+        }
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve(execution.context.len())
+        .map_err(|_| AgentRefusalV1::Capacity)?;
+    for reference in &execution.context {
+        let evidence = by_reference
+            .remove(reference)
+            .ok_or(AgentRefusalV1::InvalidInput)?;
+        entries.push(AgentContextManifestEntryV1 {
+            reference: evidence.reference,
+            kind: evidence.kind,
+            source_digest: evidence.source_digest,
+            content_bytes: evidence.bytes.len(),
+            grounding: evidence.grounding,
+        });
+    }
+    if !by_reference.is_empty() {
+        return Err(AgentRefusalV1::InvalidInput);
+    }
+
+    let manifest_digest = context_manifest_digest(execution.execution_id, &entries)?;
+    Ok(AgentContextReceiptV1 {
+        execution: execution.execution_id,
+        manifest_digest,
+        entries,
+    })
+}
+
+fn valid_context_receipt(
+    execution: &protocol::ExecuteRequestV1,
+    receipt: &AgentContextReceiptV1,
+) -> bool {
+    receipt.execution == execution.execution_id
+        && execution.context.len() == receipt.entries.len()
+        && execution
+            .context
+            .iter()
+            .zip(&receipt.entries)
+            .all(|(reference, entry)| {
+                reference == &entry.reference
+                    && entry.content_bytes > 0
+                    && entry.source_digest.into_bytes() != [0; 32]
+                    && (entry.kind == protocol::ContextKindV1::DendriteGrounding)
+                        == entry.grounding.is_some()
+            })
+        && context_manifest_digest(receipt.execution, &receipt.entries)
+            .is_ok_and(|digest| digest == receipt.manifest_digest)
+}
+
+fn context_manifest_digest(
+    execution: protocol::ExecutionIdV1,
+    entries: &[AgentContextManifestEntryV1],
+) -> Result<protocol::ContentDigestV1, AgentRefusalV1> {
+    let mut digest = Sha256::new();
+    digest.update(b"DAIMON_AGENT_CONTEXT_MANIFEST_V1\0");
+    digest.update(execution.into_bytes());
+    digest.update(
+        u64::try_from(entries.len())
+            .map_err(|_| AgentRefusalV1::Capacity)?
+            .to_be_bytes(),
+    );
+    for entry in entries {
+        digest.update(entry.reference.into_bytes());
+        digest.update([match entry.kind {
+            protocol::ContextKindV1::AgoraMessage => 1,
+            protocol::ContextKindV1::ChronosWork => 2,
+            protocol::ContextKindV1::VellumDocument => 3,
+            protocol::ContextKindV1::DendriteGrounding => 4,
+        }]);
+        digest.update(entry.source_digest.into_bytes());
+        digest.update(
+            u64::try_from(entry.content_bytes)
+                .map_err(|_| AgentRefusalV1::Capacity)?
+                .to_be_bytes(),
+        );
+        match entry.grounding {
+            None => digest.update([0]),
+            Some(grounding) => {
+                digest.update([1]);
+                digest.update([match grounding.depth {
+                    protocol::GroundingDepthV1::Ambient => 1,
+                    protocol::GroundingDepthV1::Activated => 2,
+                    protocol::GroundingDepthV1::Reference => 3,
+                }]);
+                digest.update(grounding.grounding_digest.into_bytes());
+                digest.update(grounding.surface_digest.into_bytes());
+            }
+        }
+    }
+    Ok(protocol::ContentDigestV1::new(digest.finalize().into()))
 }
 
 fn map_refusal(refusal: protocol::RefusalV1) -> AgentRefusalV1 {

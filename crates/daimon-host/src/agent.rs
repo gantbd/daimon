@@ -372,6 +372,7 @@ pub struct StoredAgentSessionV1 {
     pub active_turn: Option<AgentTurnIdV1>,
     pub capabilities: AgentCapabilitiesV1,
     pub recovery: Option<AgentProviderRecoveryV1>,
+    pub last_context: Option<daimon_protocol::agent::AgentContextReceiptV1>,
     pub events: Vec<AgentEventRecordV1>,
     pub operations: Vec<StoredAgentOperationV1>,
 }

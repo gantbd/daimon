@@ -2,7 +2,7 @@
 
 use daimon_protocol::{agent::*, *};
 
-const MAGIC: &[u8; 8] = b"DAIMONA1";
+const MAGIC: &[u8; 8] = b"DAIMONA2";
 const REQUEST: u8 = 1;
 const REPLY: u8 = 2;
 
@@ -602,7 +602,7 @@ fn encode_outcome(
     match outcome {
         AgentOutcomeV1::Session(view) => {
             writer.byte(1)?;
-            encode_view(writer, view)
+            encode_view(writer, view, limits)
         }
         AgentOutcomeV1::Events(page) => {
             if page.entries.len() > limits.max_events {
@@ -661,6 +661,7 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<AgentOutcomeV1, AgentWireCo
 fn encode_view(
     writer: &mut Writer,
     view: &AgentSessionViewV1,
+    limits: AgentWireLimitsV1,
 ) -> Result<(), AgentWireCodecErrorV1> {
     writer.id(view.session.into_bytes())?;
     writer.u64(view.revision)?;
@@ -668,7 +669,8 @@ fn encode_view(
     writer.digest(view.profile_document_digest.into_bytes())?;
     encode_optional_id(writer, view.active_turn.map(AgentTurnIdV1::into_bytes))?;
     encode_optional_u64(writer, view.last_event_cursor)?;
-    writer.byte(capability_bits(view.capabilities))
+    writer.byte(capability_bits(view.capabilities))?;
+    encode_context_receipt(writer, view.last_context.as_ref(), limits)
 }
 
 fn decode_view(reader: &mut Reader<'_>) -> Result<AgentSessionViewV1, AgentWireCodecErrorV1> {
@@ -680,6 +682,7 @@ fn decode_view(reader: &mut Reader<'_>) -> Result<AgentSessionViewV1, AgentWireC
         active_turn: decode_optional_id(reader)?.map(AgentTurnIdV1::new),
         last_event_cursor: decode_optional_u64(reader)?,
         capabilities: decode_capabilities(reader.byte()?)?,
+        last_context: decode_context_receipt(reader)?,
     })
 }
 
@@ -867,6 +870,120 @@ fn event_size(event: &AgentEventV1) -> usize {
             ),
         AgentEventV1::FileChange { path, .. } | AgentEventV1::FileRead { path, .. } => path.len(),
         AgentEventV1::Usage { .. } | AgentEventV1::TurnFinished { .. } => 0,
+    }
+}
+
+fn encode_context_receipt(
+    writer: &mut Writer,
+    receipt: Option<&AgentContextReceiptV1>,
+    limits: AgentWireLimitsV1,
+) -> Result<(), AgentWireCodecErrorV1> {
+    writer.byte(u8::from(receipt.is_some()))?;
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    if receipt.entries.len() > limits.max_context_references {
+        return Err(AgentWireCodecErrorV1::Limit);
+    }
+    writer.id(receipt.execution.into_bytes())?;
+    writer.digest(receipt.manifest_digest.into_bytes())?;
+    writer.u32(receipt.entries.len())?;
+    for entry in &receipt.entries {
+        writer.id(entry.reference.into_bytes())?;
+        writer.byte(context_kind_tag(entry.kind))?;
+        writer.digest(entry.source_digest.into_bytes())?;
+        writer
+            .u64(u64::try_from(entry.content_bytes).map_err(|_| AgentWireCodecErrorV1::Limit)?)?;
+        encode_grounding(writer, entry.grounding)?;
+    }
+    Ok(())
+}
+
+fn decode_context_receipt(
+    reader: &mut Reader<'_>,
+) -> Result<Option<AgentContextReceiptV1>, AgentWireCodecErrorV1> {
+    match reader.byte()? {
+        0 => Ok(None),
+        1 => {
+            let execution = ExecutionIdV1::new(reader.id()?);
+            let manifest_digest = ContentDigestV1::new(reader.digest()?);
+            let count = bounded_count(reader, reader.limits.max_context_references, 58)?;
+            let mut entries = Vec::new();
+            entries
+                .try_reserve(count)
+                .map_err(|_| AgentWireCodecErrorV1::Capacity)?;
+            for _ in 0..count {
+                entries.push(AgentContextManifestEntryV1 {
+                    reference: ContextReferenceIdV1::new(reader.id()?),
+                    kind: decode_context_kind(reader.byte()?)?,
+                    source_digest: ContentDigestV1::new(reader.digest()?),
+                    content_bytes: usize::try_from(reader.u64()?)
+                        .map_err(|_| AgentWireCodecErrorV1::Limit)?,
+                    grounding: decode_grounding(reader)?,
+                });
+            }
+            Ok(Some(AgentContextReceiptV1 {
+                execution,
+                manifest_digest,
+                entries,
+            }))
+        }
+        _ => Err(AgentWireCodecErrorV1::Malformed),
+    }
+}
+
+fn encode_grounding(
+    writer: &mut Writer,
+    grounding: Option<GroundingEvidenceV1>,
+) -> Result<(), AgentWireCodecErrorV1> {
+    writer.byte(u8::from(grounding.is_some()))?;
+    if let Some(grounding) = grounding {
+        writer.byte(match grounding.depth {
+            GroundingDepthV1::Ambient => 1,
+            GroundingDepthV1::Activated => 2,
+            GroundingDepthV1::Reference => 3,
+        })?;
+        writer.digest(grounding.grounding_digest.into_bytes())?;
+        writer.digest(grounding.surface_digest.into_bytes())?;
+    }
+    Ok(())
+}
+
+fn decode_grounding(
+    reader: &mut Reader<'_>,
+) -> Result<Option<GroundingEvidenceV1>, AgentWireCodecErrorV1> {
+    match reader.byte()? {
+        0 => Ok(None),
+        1 => Ok(Some(GroundingEvidenceV1 {
+            depth: match reader.byte()? {
+                1 => GroundingDepthV1::Ambient,
+                2 => GroundingDepthV1::Activated,
+                3 => GroundingDepthV1::Reference,
+                _ => return Err(AgentWireCodecErrorV1::Malformed),
+            },
+            grounding_digest: ContentDigestV1::new(reader.digest()?),
+            surface_digest: ContentDigestV1::new(reader.digest()?),
+        })),
+        _ => Err(AgentWireCodecErrorV1::Malformed),
+    }
+}
+
+fn context_kind_tag(kind: ContextKindV1) -> u8 {
+    match kind {
+        ContextKindV1::AgoraMessage => 1,
+        ContextKindV1::ChronosWork => 2,
+        ContextKindV1::VellumDocument => 3,
+        ContextKindV1::DendriteGrounding => 4,
+    }
+}
+
+fn decode_context_kind(value: u8) -> Result<ContextKindV1, AgentWireCodecErrorV1> {
+    match value {
+        1 => Ok(ContextKindV1::AgoraMessage),
+        2 => Ok(ContextKindV1::ChronosWork),
+        3 => Ok(ContextKindV1::VellumDocument),
+        4 => Ok(ContextKindV1::DendriteGrounding),
+        _ => Err(AgentWireCodecErrorV1::Malformed),
     }
 }
 

@@ -288,7 +288,7 @@ pub fn encode(
     }
     let mut writer = Writer::new(limits.max_bytes);
     writer.raw(MAGIC)?;
-    writer.byte(1)?;
+    writer.byte(2)?;
     writer.number(count(snapshot.sessions.len())?)?;
     let mut previous = None;
     for session in &snapshot.sessions {
@@ -307,7 +307,11 @@ pub fn decode(
     limits: AgentStoreLimitsV1,
 ) -> Result<AgentServiceSnapshotV1, CodecErrorV1> {
     let mut reader = Reader::new(bytes, limits)?;
-    if reader.raw::<8>()? != *MAGIC || reader.byte()? != 1 {
+    if reader.raw::<8>()? != *MAGIC {
+        return Err(CodecErrorV1::Invalid);
+    }
+    let version = reader.byte()?;
+    if !matches!(version, 1 | 2) {
         return Err(CodecErrorV1::Invalid);
     }
     let session_count = reader.count(limits.max_sessions, 1)?;
@@ -317,7 +321,7 @@ pub fn decode(
         .map_err(|_| CodecErrorV1::Capacity)?;
     let mut identities = BTreeSet::new();
     for _ in 0..session_count {
-        let session = decode_session(&mut reader)?;
+        let session = decode_session(&mut reader, version)?;
         if !identities.insert(session.request.session) {
             return Err(CodecErrorV1::Invalid);
         }
@@ -363,6 +367,7 @@ fn encode_session(
         }
         None => writer.byte(0)?,
     }
+    encode_context_receipt(writer, session.last_context.as_ref(), limits)?;
     writer.number(count(session.events.len())?)?;
     for event in &session.events {
         writer.number(event.cursor)?;
@@ -381,7 +386,10 @@ fn encode_session(
     Ok(())
 }
 
-fn decode_session(reader: &mut Reader<'_>) -> Result<StoredAgentSessionV1, CodecErrorV1> {
+fn decode_session(
+    reader: &mut Reader<'_>,
+    version: u8,
+) -> Result<StoredAgentSessionV1, CodecErrorV1> {
     let request = decode_open_request(reader)?;
     let open_preparation = decode_preparation(reader)?;
     let profile = decode_profile(reader)?;
@@ -395,6 +403,11 @@ fn decode_session(reader: &mut Reader<'_>) -> Result<StoredAgentSessionV1, Codec
             locator: reader.field(daimon_host::agent::MAX_AGENT_PROVIDER_LOCATOR_BYTES)?,
         }),
         _ => return Err(CodecErrorV1::Invalid),
+    };
+    let last_context = if version >= 2 {
+        decode_context_receipt(reader)?
+    } else {
+        None
     };
     let event_count = reader.count(reader.limits.max_events_per_session, 9)?;
     let mut events = Vec::new();
@@ -414,7 +427,7 @@ fn decode_session(reader: &mut Reader<'_>) -> Result<StoredAgentSessionV1, Codec
         .map_err(|_| CodecErrorV1::Capacity)?;
     let mut identities = BTreeSet::new();
     for _ in 0..operation_count {
-        let operation = decode_operation(reader)?;
+        let operation = decode_operation(reader, version)?;
         if !identities.insert(operation.idempotency_key) {
             return Err(CodecErrorV1::Invalid);
         }
@@ -435,6 +448,7 @@ fn decode_session(reader: &mut Reader<'_>) -> Result<StoredAgentSessionV1, Codec
         active_turn,
         capabilities,
         recovery,
+        last_context,
         events,
         operations,
     })
@@ -692,12 +706,15 @@ fn encode_operation(
         StoredAgentOperationStateV1::OutcomeUnknown => writer.byte(0),
         StoredAgentOperationStateV1::Completed(view) => {
             writer.byte(1)?;
-            encode_view(writer, view)
+            encode_view(writer, view, limits)
         }
     }
 }
 
-fn decode_operation(reader: &mut Reader<'_>) -> Result<StoredAgentOperationV1, CodecErrorV1> {
+fn decode_operation(
+    reader: &mut Reader<'_>,
+    version: u8,
+) -> Result<StoredAgentOperationV1, CodecErrorV1> {
     let idempotency_key = protocol::IdempotencyKeyV1::new(reader.id()?);
     let input = match reader.byte()? {
         0 => StoredAgentOperationInputV1::Prompt(AgentTurnRequestV1 {
@@ -740,7 +757,7 @@ fn decode_operation(reader: &mut Reader<'_>) -> Result<StoredAgentOperationV1, C
     };
     let state = match reader.byte()? {
         0 => StoredAgentOperationStateV1::OutcomeUnknown,
-        1 => StoredAgentOperationStateV1::Completed(decode_view(reader)?),
+        1 => StoredAgentOperationStateV1::Completed(decode_view(reader, version)?),
         _ => return Err(CodecErrorV1::Invalid),
     };
     Ok(StoredAgentOperationV1 {
@@ -751,7 +768,11 @@ fn decode_operation(reader: &mut Reader<'_>) -> Result<StoredAgentOperationV1, C
     })
 }
 
-fn encode_view(writer: &mut Writer, view: &AgentSessionViewV1) -> Result<(), CodecErrorV1> {
+fn encode_view(
+    writer: &mut Writer,
+    view: &AgentSessionViewV1,
+    limits: AgentStoreLimitsV1,
+) -> Result<(), CodecErrorV1> {
     writer.id(view.session.into_bytes())?;
     writer.number(view.revision)?;
     writer.byte(phase_tag(view.phase))?;
@@ -761,10 +782,11 @@ fn encode_view(writer: &mut Writer, view: &AgentSessionViewV1) -> Result<(), Cod
         view.active_turn.map(protocol::AgentTurnIdV1::into_bytes),
     )?;
     encode_optional_number(writer, view.last_event_cursor)?;
-    writer.byte(capability_bits(view.capabilities))
+    writer.byte(capability_bits(view.capabilities))?;
+    encode_context_receipt(writer, view.last_context.as_ref(), limits)
 }
 
-fn decode_view(reader: &mut Reader<'_>) -> Result<AgentSessionViewV1, CodecErrorV1> {
+fn decode_view(reader: &mut Reader<'_>, version: u8) -> Result<AgentSessionViewV1, CodecErrorV1> {
     Ok(AgentSessionViewV1 {
         session: protocol::AgentSessionIdV1::new(reader.id()?),
         revision: reader.number()?,
@@ -773,6 +795,11 @@ fn decode_view(reader: &mut Reader<'_>) -> Result<AgentSessionViewV1, CodecError
         active_turn: decode_optional_id(reader)?.map(protocol::AgentTurnIdV1::new),
         last_event_cursor: decode_optional_number(reader)?,
         capabilities: decode_capabilities(reader.byte()?),
+        last_context: if version >= 2 {
+            decode_context_receipt(reader)?
+        } else {
+            None
+        },
     })
 }
 
@@ -962,6 +989,119 @@ fn event_size(event: &AgentEventV1) -> usize {
             ),
         AgentEventV1::FileChange { path, .. } | AgentEventV1::FileRead { path, .. } => path.len(),
         AgentEventV1::Usage { .. } | AgentEventV1::TurnFinished { .. } => 0,
+    }
+}
+
+fn encode_context_receipt(
+    writer: &mut Writer,
+    receipt: Option<&AgentContextReceiptV1>,
+    limits: AgentStoreLimitsV1,
+) -> Result<(), CodecErrorV1> {
+    writer.byte(u8::from(receipt.is_some()))?;
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    if receipt.entries.len() > limits.max_context_references {
+        return Err(CodecErrorV1::Limit);
+    }
+    writer.id(receipt.execution.into_bytes())?;
+    writer.digest(receipt.manifest_digest.into_bytes())?;
+    writer.number(count(receipt.entries.len())?)?;
+    for entry in &receipt.entries {
+        writer.id(entry.reference.into_bytes())?;
+        writer.byte(context_kind_tag(entry.kind))?;
+        writer.digest(entry.source_digest.into_bytes())?;
+        writer.number(u64::try_from(entry.content_bytes).map_err(|_| CodecErrorV1::Limit)?)?;
+        encode_grounding(writer, entry.grounding)?;
+    }
+    Ok(())
+}
+
+fn decode_context_receipt(
+    reader: &mut Reader<'_>,
+) -> Result<Option<AgentContextReceiptV1>, CodecErrorV1> {
+    match reader.byte()? {
+        0 => Ok(None),
+        1 => {
+            let execution = protocol::ExecutionIdV1::new(reader.id()?);
+            let manifest_digest = protocol::ContentDigestV1::new(reader.digest()?);
+            let entry_count = reader.count(reader.limits.max_context_references, 58)?;
+            let mut entries = Vec::new();
+            entries
+                .try_reserve(entry_count)
+                .map_err(|_| CodecErrorV1::Capacity)?;
+            for _ in 0..entry_count {
+                entries.push(AgentContextManifestEntryV1 {
+                    reference: protocol::ContextReferenceIdV1::new(reader.id()?),
+                    kind: decode_context_kind(reader.byte()?)?,
+                    source_digest: protocol::ContentDigestV1::new(reader.digest()?),
+                    content_bytes: usize::try_from(reader.number()?)
+                        .map_err(|_| CodecErrorV1::Limit)?,
+                    grounding: decode_grounding(reader)?,
+                });
+            }
+            Ok(Some(AgentContextReceiptV1 {
+                execution,
+                manifest_digest,
+                entries,
+            }))
+        }
+        _ => Err(CodecErrorV1::Invalid),
+    }
+}
+
+fn encode_grounding(
+    writer: &mut Writer,
+    grounding: Option<protocol::GroundingEvidenceV1>,
+) -> Result<(), CodecErrorV1> {
+    writer.byte(u8::from(grounding.is_some()))?;
+    if let Some(grounding) = grounding {
+        writer.byte(match grounding.depth {
+            protocol::GroundingDepthV1::Ambient => 0,
+            protocol::GroundingDepthV1::Activated => 1,
+            protocol::GroundingDepthV1::Reference => 2,
+        })?;
+        writer.digest(grounding.grounding_digest.into_bytes())?;
+        writer.digest(grounding.surface_digest.into_bytes())?;
+    }
+    Ok(())
+}
+
+fn decode_grounding(
+    reader: &mut Reader<'_>,
+) -> Result<Option<protocol::GroundingEvidenceV1>, CodecErrorV1> {
+    match reader.byte()? {
+        0 => Ok(None),
+        1 => Ok(Some(protocol::GroundingEvidenceV1 {
+            depth: match reader.byte()? {
+                0 => protocol::GroundingDepthV1::Ambient,
+                1 => protocol::GroundingDepthV1::Activated,
+                2 => protocol::GroundingDepthV1::Reference,
+                _ => return Err(CodecErrorV1::Invalid),
+            },
+            grounding_digest: protocol::ContentDigestV1::new(reader.digest()?),
+            surface_digest: protocol::ContentDigestV1::new(reader.digest()?),
+        })),
+        _ => Err(CodecErrorV1::Invalid),
+    }
+}
+
+fn context_kind_tag(kind: protocol::ContextKindV1) -> u8 {
+    match kind {
+        protocol::ContextKindV1::AgoraMessage => 0,
+        protocol::ContextKindV1::ChronosWork => 1,
+        protocol::ContextKindV1::VellumDocument => 2,
+        protocol::ContextKindV1::DendriteGrounding => 3,
+    }
+}
+
+fn decode_context_kind(value: u8) -> Result<protocol::ContextKindV1, CodecErrorV1> {
+    match value {
+        0 => Ok(protocol::ContextKindV1::AgoraMessage),
+        1 => Ok(protocol::ContextKindV1::ChronosWork),
+        2 => Ok(protocol::ContextKindV1::VellumDocument),
+        3 => Ok(protocol::ContextKindV1::DendriteGrounding),
+        _ => Err(CodecErrorV1::Invalid),
     }
 }
 

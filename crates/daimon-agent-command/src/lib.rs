@@ -961,6 +961,7 @@ mod tests {
             profile_document_digest: ContentDigestV1::new([3; 32]),
             active_turn: Some(request().turn),
             last_event_cursor: Some(2),
+            last_context: None,
             capabilities: AgentCapabilitiesV1 {
                 load_session: true,
                 resume_session: true,

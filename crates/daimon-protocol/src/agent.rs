@@ -5,8 +5,8 @@
 
 use super::{
     AgentPermissionOptionIdV1, AgentPermissionRequestIdV1, AgentSessionIdV1, AgentTurnIdV1,
-    ContentDigestV1, ExecuteRequestV1, ExecutionDispositionV1, HarnessProfileIdV1,
-    IdempotencyKeyV1, ProviderProfileIdV1,
+    ContentDigestV1, ContextKindV1, ContextReferenceIdV1, ExecuteRequestV1, ExecutionDispositionV1,
+    ExecutionIdV1, GroundingEvidenceV1, HarnessProfileIdV1, IdempotencyKeyV1, ProviderProfileIdV1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,6 +214,29 @@ pub struct AgentEventRecordV1 {
     pub event: AgentEventV1,
 }
 
+/// Content-free identity of one context item admitted by Daimon for an exact
+/// agent execution. The source digest binds the bytes retained by the context
+/// owner; the bytes themselves remain outside public session telemetry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentContextManifestEntryV1 {
+    pub reference: ContextReferenceIdV1,
+    pub kind: ContextKindV1,
+    pub source_digest: ContentDigestV1,
+    pub content_bytes: usize,
+    pub grounding: Option<GroundingEvidenceV1>,
+}
+
+/// Daimon-owned receipt for the exact context identities admitted to one
+/// successful provider operation. It is kept outside the provider event stream
+/// so provider and service cursors cannot impersonate or collide with each
+/// other.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentContextReceiptV1 {
+    pub execution: ExecutionIdV1,
+    pub manifest_digest: ContentDigestV1,
+    pub entries: Vec<AgentContextManifestEntryV1>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentSessionViewV1 {
     pub session: AgentSessionIdV1,
@@ -222,6 +245,7 @@ pub struct AgentSessionViewV1 {
     pub profile_document_digest: ContentDigestV1,
     pub active_turn: Option<AgentTurnIdV1>,
     pub last_event_cursor: Option<u64>,
+    pub last_context: Option<AgentContextReceiptV1>,
     pub capabilities: AgentCapabilitiesV1,
 }
 

@@ -42,6 +42,7 @@ impl AgentServicePort for Port {
                 profile_document_digest: ContentDigestV1::new([2; 32]),
                 active_turn: None,
                 last_event_cursor: None,
+                last_context: None,
                 capabilities: AgentCapabilitiesV1::default(),
             })),
         })

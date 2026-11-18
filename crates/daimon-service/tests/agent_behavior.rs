@@ -15,7 +15,7 @@ use daimon_protocol::agent::{
     AgentSessionBudgetV1, AgentSessionPhaseV1, AgentTurnRequestV1, AgentTurnStopReasonV1,
     AgentWireProfileV1,
 };
-use daimon_service::agent::{AgentService, AgentServiceLimitsV1};
+use daimon_service::agent::{AgentRecoveryError, AgentService, AgentServiceLimitsV1};
 use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
@@ -63,7 +63,7 @@ fn execution(execution: u8, idempotency: u8) -> protocol::ExecuteRequestV1 {
         principal: protocol::PrincipalIdV1::new([3; 16]),
         profile: protocol::HarnessProfileIdV1::new([4; 16]),
         idempotency_key: protocol::IdempotencyKeyV1::new([idempotency; 16]),
-        context: Vec::new(),
+        context: vec![protocol::ContextReferenceIdV1::new([30; 16])],
         tools: Vec::new(),
         budget: protocol::ExecutionBudgetV1 {
             max_elapsed_millis: 1_000,
@@ -170,7 +170,13 @@ impl AgentContextAssembler for Context {
         _request: &AgentOpenRequestV1,
         _profile: &AgentProfileSnapshotV1,
     ) -> Result<Vec<protocol::ContextEvidenceV1>, ContextRefusalV1> {
-        Ok(Vec::new())
+        Ok(vec![protocol::ContextEvidenceV1 {
+            reference: protocol::ContextReferenceIdV1::new([30; 16]),
+            kind: protocol::ContextKindV1::VellumDocument,
+            bytes: b"exact Vellum revision".to_vec(),
+            source_digest: protocol::ContentDigestV1::new([31; 32]),
+            grounding: None,
+        }])
     }
 
     fn assemble_agent_turn_context(
@@ -179,7 +185,7 @@ impl AgentContextAssembler for Context {
         _request: &AgentTurnRequestV1,
         _profile: &AgentProfileSnapshotV1,
     ) -> Result<Vec<protocol::ContextEvidenceV1>, ContextRefusalV1> {
-        Ok(Vec::new())
+        self.assemble_agent_context(_service_session, &open_request(), _profile)
     }
 }
 
@@ -516,6 +522,22 @@ fn authorized_open_and_prompt_preserve_typed_events_and_replay_without_redispatc
     assert_eq!(opened.revision, 1);
     assert_eq!(opened.phase, AgentSessionPhaseV1::Ready);
     assert!(opened.capabilities.permissions);
+    let opened_context = opened.last_context.expect("open context receipt");
+    assert_eq!(
+        opened_context.execution,
+        open_request().execution.execution_id
+    );
+    assert_ne!(opened_context.manifest_digest.into_bytes(), [0; 32]);
+    assert_eq!(opened_context.entries.len(), 1);
+    assert_eq!(
+        opened_context.entries[0].kind,
+        protocol::ContextKindV1::VellumDocument
+    );
+    assert_eq!(
+        opened_context.entries[0].source_digest.into_bytes(),
+        [31; 32]
+    );
+    assert_eq!(opened_context.entries[0].content_bytes, 21);
 
     let prompt = AgentCommandV1::Prompt {
         request: turn_request(),
@@ -527,6 +549,14 @@ fn authorized_open_and_prompt_preserve_typed_events_and_replay_without_redispatc
     };
     assert_eq!(completed.revision, 2);
     assert_eq!(completed.last_event_cursor, Some(1));
+    assert_eq!(
+        completed
+            .last_context
+            .as_ref()
+            .expect("turn context receipt")
+            .execution,
+        turn_request().execution.execution_id
+    );
 
     assert_eq!(service.execute(handle, prompt), first);
     assert_eq!(invocations.borrow().len(), 2);
@@ -883,6 +913,61 @@ fn completed_agent_turn_reopens_and_replays_without_provider_redispatch() {
     assert_eq!(invocations.borrow().len(), 2);
     assert_eq!(attempts.get(), 2);
     assert_eq!(authorizations.get(), 4);
+}
+
+#[test]
+fn recovery_refuses_mutated_context_manifest_identity() {
+    let store = SharedStore::default();
+    let mut first = durable_service(
+        store.clone(),
+        Rc::new(Cell::new(0)),
+        Rc::new(Cell::new(0)),
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let handle = first.open_service_session(facts()).unwrap();
+    first.execute(
+        handle,
+        AgentCommandV1::Open {
+            request: open_request(),
+            now: 10,
+        },
+    );
+    first.execute(
+        handle,
+        AgentCommandV1::Prompt {
+            request: turn_request(),
+            now: 11,
+        },
+    );
+    drop(first);
+    store.snapshot.borrow_mut().as_mut().unwrap().sessions[0]
+        .last_context
+        .as_mut()
+        .unwrap()
+        .manifest_digest = protocol::ContentDigestV1::new([99; 32]);
+
+    let reopened = AgentService::open(
+        daimon_harness::Limits::default(),
+        AgentServiceLimitsV1 {
+            max_service_sessions: 2,
+            max_agent_sessions: 4,
+            max_events_per_page: 8,
+        },
+        Allow(Rc::new(Cell::new(0))),
+        Current(Rc::new(Cell::new(0))),
+        Profiles,
+        Context,
+        Provider {
+            invocations: Rc::new(RefCell::new(Vec::new())),
+        },
+        store,
+    );
+    assert!(matches!(
+        reopened,
+        Err(AgentRecoveryError::InvalidSnapshot(
+            protocol::agent::AgentRefusalV1::InvalidInput
+        ))
+    ));
 }
 
 #[test]
