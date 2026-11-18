@@ -354,6 +354,7 @@ dependencies = [
  "daimon-aegis",
  "daimon-checkpoint",
  "daimon-chronos",
+ "daimon-client",
  "daimon-dendrite",
  "daimon-harness",
  "daimon-host",

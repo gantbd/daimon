@@ -278,6 +278,16 @@ cargo run -p daimon-local-model --release --locked --offline -- \
   config/local-model.json
 ```
 
+When `task_execution` is present, Pantheon may submit one exact, reviewed task
+attempt through `--invoke-task`. The owner requires the current document digest,
+the exact retained completion-qualification operation, and one configured
+Chronos task binding; principal, provider/profile, attempt, context, tools and
+budget remain owner-derived. It persists an operation marker before contacting
+the running model service, returns the retained attributed output/usage/evidence
+receipt, and never redispatches a replay or an uncertain operation. Editing the
+provider document does not mutate the already-running frozen service: drain and
+restart the owner before qualifying or invoking the new profile.
+
 For endpoints requiring a token, set `bearer_token_env` to an environment-variable
 name. The token is loaded at startup and excluded from the frozen profile digest,
 checkpoint, protocol and diagnostics. The example uses structured-output mode so

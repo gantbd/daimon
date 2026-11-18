@@ -7,6 +7,7 @@ use chronos_client::WireClientV1;
 use daimon_aegis::{AegisAuthorizer, grant_context};
 use daimon_checkpoint::model::ModelStoreLimitsV1;
 use daimon_chronos::{ChronosAttemptValidator, TaskBindingV1};
+use daimon_client::{ModelExecutionClient, unix::connect_model};
 use daimon_dendrite::{
     ContextBindingV1, GroundingContextAssembler, McpEndpointV1, StreamableHttpClient,
     SurfaceQueryV1,
@@ -47,6 +48,7 @@ use std::{
 };
 
 const MAX_QUALIFICATION_RECORDS: usize = 32;
+const MAX_TASK_INVOCATION_RECORDS: usize = 64;
 const QUALIFICATION_PROMPT: &[u8] = b"Respond with a short confirmation that this local model can complete a bounded request. Do not request tools or propose external effects.";
 static NEXT_QUALIFICATION_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -63,6 +65,8 @@ pub struct ConfigV1 {
     pub store_directory: PathBuf,
     pub provider: ProviderConfigV1,
     pub task_bindings: Vec<TaskBindingConfigV1>,
+    #[serde(default)]
+    pub task_execution: Option<TaskExecutionConfigV1>,
     #[serde(default)]
     pub tool_capabilities: Vec<String>,
     #[serde(default)]
@@ -112,6 +116,25 @@ pub struct ProviderConfigV1 {
 pub struct TaskBindingConfigV1 {
     pub external_task_key: String,
     pub chronos_task_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskExecutionConfigV1 {
+    pub task_incarnation: u64,
+    pub attempt_number: u32,
+    pub budget: TaskExecutionBudgetConfigV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskExecutionBudgetConfigV1 {
+    pub max_elapsed_millis: u64,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub max_tool_calls: u32,
+    pub max_context_bytes: usize,
+    pub max_output_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -218,13 +241,28 @@ struct ProviderCatalogV1<'a> {
     document_digest: String,
     providers: [ProviderCatalogEntryV1<'a>; 1],
     task_bindings: Vec<TaskBindingCatalogEntryV1<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_execution: Option<TaskExecutionCatalogV1<'a>>,
     contexts: Vec<ContextCatalogEntryV1<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_task_invocation: Option<TaskInvocationSummaryV1>,
 }
 
 #[derive(Serialize)]
 struct TaskBindingCatalogEntryV1<'a> {
     external_task_key: &'a str,
     chronos_task_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct TaskExecutionCatalogV1<'a> {
+    principal: &'a str,
+    harness_profile_id: &'a str,
+    task_incarnation: u64,
+    attempt_number: u32,
+    context_references: Vec<&'a str>,
+    tool_capabilities: Vec<&'a str>,
+    budget: TaskExecutionBudgetConfigV1,
 }
 
 #[derive(Serialize)]
@@ -260,6 +298,84 @@ pub struct ProviderQualificationRequestV1 {
     pub version: u8,
     pub operation_id: String,
     pub expected_document_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskInvocationRequestV1 {
+    pub version: u8,
+    pub operation_id: String,
+    pub expected_document_digest: String,
+    pub qualification_operation_id: String,
+    pub chronos_task_id: String,
+    pub now: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TaskInvocationRecordV1 {
+    version: u8,
+    owner: String,
+    operation_id: String,
+    document_digest: String,
+    qualification_operation_id: String,
+    profile_document_digest: String,
+    chronos_task_id: String,
+    task_key: String,
+    task_incarnation: u64,
+    attempt_number: u32,
+    principal: String,
+    provider_id: String,
+    harness_profile_id: String,
+    model: String,
+    context_references: Vec<String>,
+    tool_capabilities: Vec<String>,
+    budget: TaskExecutionBudgetConfigV1,
+    request_now: u64,
+    host_observed_at_unix_ms: u64,
+    disposition: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    output_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_digest: Option<String>,
+    proposal_count: usize,
+    output: String,
+    known_deviations: Vec<String>,
+    replayed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TaskInvocationSummaryV1 {
+    version: u8,
+    operation_id: String,
+    document_digest: String,
+    qualification_operation_id: String,
+    chronos_task_id: String,
+    task_key: String,
+    task_incarnation: u64,
+    attempt_number: u32,
+    principal: String,
+    provider_id: String,
+    harness_profile_id: String,
+    model: String,
+    context_references: Vec<String>,
+    tool_capabilities: Vec<String>,
+    budget: TaskExecutionBudgetConfigV1,
+    request_now: u64,
+    host_observed_at_unix_ms: u64,
+    disposition: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    output_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_digest: Option<String>,
+    proposal_count: usize,
+    known_deviations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -333,6 +449,27 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
                 chronos_task_id: &binding.chronos_task_id,
             })
             .collect(),
+        task_execution: validated.raw.task_execution.as_ref().map(|execution| {
+            TaskExecutionCatalogV1 {
+                principal: &validated.raw.principal,
+                harness_profile_id: &validated.raw.provider.harness_profile_id,
+                task_incarnation: execution.task_incarnation,
+                attempt_number: execution.attempt_number,
+                context_references: validated
+                    .raw
+                    .context
+                    .iter()
+                    .map(|context| context.reference.as_str())
+                    .collect(),
+                tool_capabilities: validated
+                    .raw
+                    .tool_capabilities
+                    .iter()
+                    .map(String::as_str)
+                    .collect(),
+                budget: execution.budget,
+            }
+        }),
         contexts: validated
             .raw
             .context
@@ -353,6 +490,7 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
                 bytes: context.text.as_ref().map(String::len),
             })
             .collect(),
+        latest_task_invocation: latest_task_invocation(&validated, &document_digest),
     })
     .map_err(|_| ConfigErrorV1::Json)
 }
@@ -729,6 +867,283 @@ fn map_document_error(error: DocumentErrorV1) -> ProviderEditErrorV1 {
     }
 }
 
+/// Executes one exact, owner-configured task attempt through the already
+/// running model service. The owner retains an operation marker before the
+/// service request; replay returns the retained result and never redispatches.
+pub fn invoke_task_json(
+    path: impl AsRef<Path>,
+    request_bytes: &[u8],
+) -> Result<String, ConfigErrorV1> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|_| ConfigErrorV1::Io)?;
+    let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ConfigErrorV1::Json)?;
+    let validated = validate(raw)?;
+    let request: TaskInvocationRequestV1 =
+        serde_json::from_slice(request_bytes).map_err(|_| ConfigErrorV1::Json)?;
+    let document_digest = digest_text(Sha256::digest(&bytes).into());
+    if request.version != 1
+        || hex_id(&request.operation_id).is_err()
+        || hex_id(&request.qualification_operation_id).is_err()
+        || request.expected_document_digest != document_digest
+        || request.chronos_task_id.is_empty()
+        || request.chronos_task_id.len() > 256
+        || request.now == 0
+    {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    let execution = validated
+        .raw
+        .task_execution
+        .as_ref()
+        .ok_or(ConfigErrorV1::Invalid)?;
+    let mut bindings = validated
+        .raw
+        .task_bindings
+        .iter()
+        .filter(|binding| binding.chronos_task_id == request.chronos_task_id);
+    let binding = bindings.next().ok_or(ConfigErrorV1::Invalid)?;
+    if bindings.next().is_some() {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    latest_provider_qualification(&validated, &document_digest)
+        .filter(|qualification| {
+            qualification.completion
+                && qualification.disposition == "qualified_completion"
+                && qualification.operation_id == request.qualification_operation_id
+        })
+        .ok_or(ConfigErrorV1::Invalid)?;
+
+    let directory = task_invocation_directory(&validated.raw.store_directory);
+    create_private_qualification_directory(&directory)?;
+    let lock_path = directory.join("owner.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)
+        .map_err(|_| ConfigErrorV1::Io)?;
+    lock.try_lock().map_err(|_| ConfigErrorV1::Io)?;
+    let record_path = directory.join(format!("{}.json", request.operation_id));
+    if record_path.exists() {
+        let mut retained = read_task_invocation(&record_path)?;
+        validate_task_invocation_identity(
+            &retained,
+            &validated,
+            &document_digest,
+            &request,
+            binding,
+            execution,
+        )?;
+        if retained.disposition == "running" {
+            retained.disposition = "outcome_unknown".into();
+            retained.known_deviations =
+                vec!["model_service_outcome_requires_operator_reconciliation".into()];
+            write_task_invocation_atomic(&record_path, &retained)?;
+        }
+        retained.replayed = true;
+        return serde_json::to_string(&retained).map_err(|_| ConfigErrorV1::Json);
+    }
+    let record_count = fs::read_dir(&directory)
+        .map_err(|_| ConfigErrorV1::Io)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json")
+        })
+        .count();
+    if record_count >= MAX_TASK_INVOCATION_RECORDS {
+        return Err(ConfigErrorV1::Invalid);
+    }
+
+    let observed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ConfigErrorV1::Invalid)?;
+    let host_observed_at_unix_ms =
+        u64::try_from(observed.as_millis()).map_err(|_| ConfigErrorV1::Invalid)?;
+    let mut record = task_invocation_record(
+        &validated,
+        &request,
+        &document_digest,
+        binding,
+        execution,
+        host_observed_at_unix_ms,
+    );
+    write_task_invocation_new(&record_path, &record)?;
+
+    let request_identity = hex_id(&request.operation_id)?;
+    let execute = protocol::ExecuteRequestV1 {
+        execution_id: protocol::ExecutionIdV1::new(request_identity),
+        task_attempt: protocol::TaskAttemptRefV1 {
+            task_key: hex_id(&binding.external_task_key)?,
+            task_incarnation: execution.task_incarnation,
+            attempt_number: execution.attempt_number,
+        },
+        principal: protocol::PrincipalIdV1::new(validated.principal),
+        profile: validated.profile.snapshot.harness_profile,
+        idempotency_key: protocol::IdempotencyKeyV1::new(derived_operation_identity(
+            b"daimon-local-model/task-invocation/idempotency/v1",
+            request_identity,
+        )),
+        context: validated
+            .raw
+            .context
+            .iter()
+            .map(|context| hex_id(&context.reference).map(protocol::ContextReferenceIdV1::new))
+            .collect::<Result<Vec<_>, _>>()?,
+        tools: validated
+            .tools
+            .iter()
+            .copied()
+            .map(protocol::ToolCapabilityIdV1::new)
+            .collect(),
+        budget: protocol::ExecutionBudgetV1 {
+            max_elapsed_millis: execution.budget.max_elapsed_millis,
+            max_input_tokens: execution.budget.max_input_tokens,
+            max_output_tokens: execution.budget.max_output_tokens,
+            max_tool_calls: execution.budget.max_tool_calls,
+            max_context_bytes: execution.budget.max_context_bytes,
+            max_output_bytes: execution.budget.max_output_bytes,
+        },
+    };
+    let timeout = Duration::from_millis(validated.raw.io_timeout_ms);
+    match connect_model(
+        &validated.raw.daimon_socket,
+        daimon_wire::LimitsV1::default(),
+        daimon_wire::ModelLimitsV1::default(),
+        timeout,
+    ) {
+        Ok((session, port)) => {
+            let mut client = ModelExecutionClient::new(session, port);
+            match client.execute(execute, request.now) {
+                Ok(reply) => settle_task_invocation_reply(&mut record, reply, request_identity),
+                Err(daimon_client::unix::ClientErrorV1::NotSent(_)) => {
+                    record.disposition = "not_sent".into();
+                    record
+                        .known_deviations
+                        .push("model_service_request_was_not_sent".into());
+                }
+                Err(_) => {
+                    record.disposition = "outcome_unknown".into();
+                    record
+                        .known_deviations
+                        .push("model_service_outcome_requires_operator_reconciliation".into());
+                }
+            }
+        }
+        Err(daimon_client::unix::ClientErrorV1::NotSent(_)) => {
+            record.disposition = "not_sent".into();
+            record
+                .known_deviations
+                .push("model_service_connection_was_not_established".into());
+        }
+        Err(_) => {
+            record.disposition = "outcome_unknown".into();
+            record
+                .known_deviations
+                .push("model_service_connection_outcome_requires_operator_reconciliation".into());
+        }
+    }
+    write_task_invocation_atomic(&record_path, &record)?;
+    serde_json::to_string(&record).map_err(|_| ConfigErrorV1::Json)
+}
+
+fn settle_task_invocation_reply(
+    record: &mut TaskInvocationRecordV1,
+    reply: protocol::ModelReplyV1,
+    expected_execution: [u8; 16],
+) {
+    match reply {
+        protocol::ModelReplyV1::Accepted(protocol::ModelOutcomeV1::Executed(result))
+            if result.execution_id.into_bytes() == expected_execution =>
+        {
+            record.input_tokens = result.input_tokens;
+            record.output_tokens = result.output_tokens;
+            record.output_bytes = result.output.len();
+            record.output_digest = Some(digest_text(Sha256::digest(&result.output).into()));
+            record.evidence_digest = Some(digest_text(result.evidence_digest.into_bytes()));
+            record.proposal_count = result.proposals.len();
+            record.output = match String::from_utf8(result.output) {
+                Ok(output)
+                    if output.len() <= record.budget.max_output_bytes
+                        && output.chars().all(|character| {
+                            character == '\n' || character == '\t' || !character.is_control()
+                        }) =>
+                {
+                    output
+                }
+                Ok(_) => {
+                    record
+                        .known_deviations
+                        .push("provider_output_was_not_safe_bounded_text".into());
+                    String::new()
+                }
+                Err(_) => {
+                    record
+                        .known_deviations
+                        .push("provider_output_was_not_utf8".into());
+                    String::new()
+                }
+            };
+            record.disposition = match result.disposition {
+                protocol::ExecutionDispositionV1::Completed if record.proposal_count > 0 => {
+                    record
+                        .known_deviations
+                        .push("tool_or_effect_proposals_require_separate_human_review".into());
+                    "awaiting_proposal_review"
+                }
+                protocol::ExecutionDispositionV1::Completed if !record.output.is_empty() => {
+                    "completed"
+                }
+                protocol::ExecutionDispositionV1::Completed => {
+                    record
+                        .known_deviations
+                        .push("completed_provider_result_had_no_text_output".into());
+                    "nonconformant"
+                }
+                protocol::ExecutionDispositionV1::Failed => "failed",
+                protocol::ExecutionDispositionV1::Cancelled => "cancelled",
+                protocol::ExecutionDispositionV1::TimedOut => "timed_out",
+                protocol::ExecutionDispositionV1::Uncertain => "outcome_unknown",
+            }
+            .into();
+        }
+        protocol::ModelReplyV1::Accepted(protocol::ModelOutcomeV1::OutcomeUnknown {
+            execution_id,
+        }) if execution_id.into_bytes() == expected_execution => {
+            record.disposition = "outcome_unknown".into();
+            record
+                .known_deviations
+                .push("model_provider_outcome_requires_operator_reconciliation".into());
+        }
+        protocol::ModelReplyV1::Refused(refusal) => {
+            record.disposition = "refused".into();
+            record
+                .known_deviations
+                .push(format!("model_service_refused_{refusal:?}"));
+        }
+        _ => {
+            record.disposition = "nonconformant".into();
+            record
+                .known_deviations
+                .push("model_service_reply_did_not_match_the_requested_execution".into());
+        }
+    }
+}
+
+fn derived_operation_identity(domain: &[u8], operation: [u8; 16]) -> [u8; 16] {
+    let digest = Sha256::new()
+        .chain_update(domain)
+        .chain_update(operation)
+        .finalize();
+    let mut identity = [0_u8; 16];
+    identity.copy_from_slice(&digest[..16]);
+    identity
+}
+
 /// Executes one bounded, non-retried completion-conformance request and retains
 /// the redacted result under the owner store's sibling qualification directory.
 /// The operation marker is committed before provider dispatch; replay returns
@@ -1019,6 +1434,235 @@ fn latest_provider_qualification(
     })
 }
 
+fn task_invocation_directory(store: &Path) -> PathBuf {
+    let mut value = store.as_os_str().to_os_string();
+    value.push(".task-invocations");
+    PathBuf::from(value)
+}
+
+fn task_invocation_record(
+    config: &ValidatedConfigV1,
+    request: &TaskInvocationRequestV1,
+    document_digest: &str,
+    binding: &TaskBindingConfigV1,
+    execution: &TaskExecutionConfigV1,
+    host_observed_at_unix_ms: u64,
+) -> TaskInvocationRecordV1 {
+    TaskInvocationRecordV1 {
+        version: 1,
+        owner: "daimon-local-model".into(),
+        operation_id: request.operation_id.clone(),
+        document_digest: document_digest.into(),
+        qualification_operation_id: request.qualification_operation_id.clone(),
+        profile_document_digest: digest_text(config.profile.snapshot.document_digest.into_bytes()),
+        chronos_task_id: request.chronos_task_id.clone(),
+        task_key: binding.external_task_key.clone(),
+        task_incarnation: execution.task_incarnation,
+        attempt_number: execution.attempt_number,
+        principal: config.raw.principal.clone(),
+        provider_id: config.raw.provider.provider_id.clone(),
+        harness_profile_id: config.raw.provider.harness_profile_id.clone(),
+        model: config.raw.provider.model.clone(),
+        context_references: config
+            .raw
+            .context
+            .iter()
+            .map(|context| context.reference.clone())
+            .collect(),
+        tool_capabilities: config.raw.tool_capabilities.clone(),
+        budget: execution.budget,
+        request_now: request.now,
+        host_observed_at_unix_ms,
+        disposition: "running".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+        output_bytes: 0,
+        output_digest: None,
+        evidence_digest: None,
+        proposal_count: 0,
+        output: String::new(),
+        known_deviations: vec![
+            "agora_room_not_linked".into(),
+            "chronos_status_and_comment_not_published".into(),
+        ],
+        replayed: false,
+    }
+}
+
+fn validate_task_invocation_identity(
+    record: &TaskInvocationRecordV1,
+    config: &ValidatedConfigV1,
+    document_digest: &str,
+    request: &TaskInvocationRequestV1,
+    binding: &TaskBindingConfigV1,
+    execution: &TaskExecutionConfigV1,
+) -> Result<(), ConfigErrorV1> {
+    let context_references = config
+        .raw
+        .context
+        .iter()
+        .map(|context| context.reference.as_str())
+        .collect::<Vec<_>>();
+    let retained_context = record
+        .context_references
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if record.version == 1
+        && record.owner == "daimon-local-model"
+        && record.operation_id == request.operation_id
+        && record.document_digest == document_digest
+        && record.qualification_operation_id == request.qualification_operation_id
+        && record.profile_document_digest
+            == digest_text(config.profile.snapshot.document_digest.into_bytes())
+        && record.chronos_task_id == request.chronos_task_id
+        && record.task_key == binding.external_task_key
+        && record.task_incarnation == execution.task_incarnation
+        && record.attempt_number == execution.attempt_number
+        && record.principal == config.raw.principal
+        && record.provider_id == config.raw.provider.provider_id
+        && record.harness_profile_id == config.raw.provider.harness_profile_id
+        && record.model == config.raw.provider.model
+        && retained_context == context_references
+        && record.tool_capabilities == config.raw.tool_capabilities
+        && record.budget == execution.budget
+        && record.request_now == request.now
+    {
+        Ok(())
+    } else {
+        Err(ConfigErrorV1::Invalid)
+    }
+}
+
+fn write_task_invocation_new(
+    path: &Path,
+    record: &TaskInvocationRecordV1,
+) -> Result<(), ConfigErrorV1> {
+    let bytes = serde_json::to_vec(record).map_err(|_| ConfigErrorV1::Json)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| ConfigErrorV1::Io)?;
+    file.write_all(&bytes).map_err(|_| ConfigErrorV1::Io)?;
+    file.sync_all().map_err(|_| ConfigErrorV1::Io)?;
+    File::open(path.parent().ok_or(ConfigErrorV1::Invalid)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ConfigErrorV1::Io)
+}
+
+fn write_task_invocation_atomic(
+    path: &Path,
+    record: &TaskInvocationRecordV1,
+) -> Result<(), ConfigErrorV1> {
+    let temporary = path.with_extension(format!(
+        "json.next-{}-{}",
+        std::process::id(),
+        NEXT_QUALIFICATION_WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
+    if temporary.exists() {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    write_task_invocation_new(&temporary, record)?;
+    fs::rename(&temporary, path).map_err(|_| ConfigErrorV1::Io)?;
+    File::open(path.parent().ok_or(ConfigErrorV1::Invalid)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ConfigErrorV1::Io)
+}
+
+fn read_task_invocation(path: &Path) -> Result<TaskInvocationRecordV1, ConfigErrorV1> {
+    let bytes = fs::read(path).map_err(|_| ConfigErrorV1::Io)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ConfigErrorV1::Json)
+}
+
+fn task_invocation_summary(record: TaskInvocationRecordV1) -> TaskInvocationSummaryV1 {
+    TaskInvocationSummaryV1 {
+        version: record.version,
+        operation_id: record.operation_id,
+        document_digest: record.document_digest,
+        qualification_operation_id: record.qualification_operation_id,
+        chronos_task_id: record.chronos_task_id,
+        task_key: record.task_key,
+        task_incarnation: record.task_incarnation,
+        attempt_number: record.attempt_number,
+        principal: record.principal,
+        provider_id: record.provider_id,
+        harness_profile_id: record.harness_profile_id,
+        model: record.model,
+        context_references: record.context_references,
+        tool_capabilities: record.tool_capabilities,
+        budget: record.budget,
+        request_now: record.request_now,
+        host_observed_at_unix_ms: record.host_observed_at_unix_ms,
+        disposition: record.disposition,
+        input_tokens: record.input_tokens,
+        output_tokens: record.output_tokens,
+        output_bytes: record.output_bytes,
+        output_digest: record.output_digest,
+        evidence_digest: record.evidence_digest,
+        proposal_count: record.proposal_count,
+        known_deviations: record.known_deviations,
+    }
+}
+
+fn latest_task_invocation(
+    config: &ValidatedConfigV1,
+    document_digest: &str,
+) -> Option<TaskInvocationSummaryV1> {
+    let expected_profile = digest_text(config.profile.snapshot.document_digest.into_bytes());
+    let directory = task_invocation_directory(&config.raw.store_directory);
+    let mut records = fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| read_task_invocation(&entry.path()).ok())
+        .filter(|record| {
+            record.version == 1
+                && record.owner == "daimon-local-model"
+                && valid_operation_id(&record.operation_id)
+                && valid_operation_id(&record.qualification_operation_id)
+                && record.document_digest == document_digest
+                && record.profile_document_digest == expected_profile
+                && record.provider_id == config.raw.provider.provider_id
+                && record.harness_profile_id == config.raw.provider.harness_profile_id
+                && record.model == config.raw.provider.model
+                && record.known_deviations.len() <= 8
+                && record
+                    .known_deviations
+                    .iter()
+                    .all(|deviation| !deviation.is_empty() && deviation.len() <= 256)
+                && matches!(
+                    record.disposition.as_str(),
+                    "running"
+                        | "completed"
+                        | "awaiting_proposal_review"
+                        | "not_sent"
+                        | "refused"
+                        | "failed"
+                        | "cancelled"
+                        | "timed_out"
+                        | "outcome_unknown"
+                        | "nonconformant"
+                )
+        })
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.host_observed_at_unix_ms);
+    records.pop().map(|mut record| {
+        if record.disposition == "running" {
+            record.disposition = "outcome_unknown".into();
+            record.known_deviations =
+                vec!["model_service_outcome_requires_operator_reconciliation".into()];
+        }
+        task_invocation_summary(record)
+    })
+}
+
 fn digest_text(bytes: [u8; 32]) -> String {
     let mut text = String::with_capacity(71);
     text.push_str("sha256:");
@@ -1054,6 +1698,17 @@ fn validate_with_secret_resolution(
         || raw.aegis_grant_expires_at < raw.aegis_grant_now
         || raw.task_bindings.is_empty()
         || raw.messages.is_empty()
+    {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    if let Some(execution) = &raw.task_execution
+        && (execution.task_incarnation == 0
+            || execution.attempt_number == 0
+            || execution.budget.max_elapsed_millis == 0
+            || execution.budget.max_input_tokens == 0
+            || execution.budget.max_output_tokens == 0
+            || execution.budget.max_context_bytes == 0
+            || execution.budget.max_output_bytes == 0)
     {
         return Err(ConfigErrorV1::Invalid);
     }
@@ -1677,6 +2332,7 @@ mod tests {
                 external_task_key: "04040404040404040404040404040404".into(),
                 chronos_task_id: "local-task".into(),
             }],
+            task_execution: None,
             tool_capabilities: Vec::new(),
             context: vec![ContextConfigV1 {
                 reference: "05050505050505050505050505050505".into(),

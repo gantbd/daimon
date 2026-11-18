@@ -28,6 +28,18 @@
       "chronos_task_id": "local-model-task"
     }
   ],
+  "task_execution": {
+    "task_incarnation": 1,
+    "attempt_number": 1,
+    "budget": {
+      "max_elapsed_millis": 60000,
+      "max_input_tokens": 4096,
+      "max_output_tokens": 8192,
+      "max_tool_calls": 32,
+      "max_context_bytes": 1048576,
+      "max_output_bytes": 1048576
+    }
+  },
   "tool_capabilities": [],
   "context": [
     {

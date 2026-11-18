@@ -17,6 +17,7 @@ chronos-protocol = { path = "../../../chronos/protocol/chronos-protocol" }
 chronos-wire = { path = "../../../chronos/protocol/chronos-wire" }
 daimon-aegis = { path = "../../adapters/daimon-aegis" }
 daimon-checkpoint = { path = "../../adapters/daimon-checkpoint" }
+daimon-client = { path = "../../crates/daimon-client", features = ["unix"] }
 daimon-chronos = { path = "../../adapters/daimon-chronos" }
 daimon-dendrite = { path = "../../adapters/daimon-dendrite" }
 daimon-harness = { path = "../.." }

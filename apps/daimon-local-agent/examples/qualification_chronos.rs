@@ -11,10 +11,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = PathBuf::from(
         arguments
             .next()
-            .ok_or("usage: qualification_chronos SOCKET")?,
+            .ok_or("usage: qualification_chronos SOCKET [TASK]")?,
     );
+    let expected_task = arguments
+        .next()
+        .map(|value| value.into_string().map_err(|_| "task must be UTF-8"))
+        .transpose()?
+        .unwrap_or_else(|| "local-agent-task".to_owned());
     if arguments.next().is_some() {
-        return Err("usage: qualification_chronos SOCKET".into());
+        return Err("usage: qualification_chronos SOCKET [TASK]".into());
     }
     let listener = UnixListener::bind(socket)?;
     let limits = limits();
@@ -30,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
     if !matches!(
         request.command,
-        chronos_protocol::Command::Snapshot { ref task } if task == "local-agent-task"
+        chronos_protocol::Command::Snapshot { ref task } if task == &expected_task
     ) {
         return Err("Chronos qualification received an unexpected command".into());
     }
@@ -39,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         outcome: chronos_protocol::Outcome::Snapshot {
             value: Some(chronos_protocol::Entry {
                 reference: chronos_protocol::Reference {
-                    task: "local-agent-task".to_owned(),
+                    task: expected_task.clone(),
                     incarnation: "1".to_owned(),
                 },
                 snapshot: chronos_protocol::Snapshot {

@@ -4,7 +4,7 @@ use std::{
     process::ExitCode,
 };
 
-const USAGE: &str = "usage: daimon-local-model [--check | --describe-providers | --describe-provider-edit | --plan-provider-edit | --apply-provider-edit | --qualify-provider | --supervised] CONFIG.json";
+const USAGE: &str = "usage: daimon-local-model [--check | --describe-providers | --describe-provider-edit | --plan-provider-edit | --apply-provider-edit | --qualify-provider | --invoke-task | --supervised] CONFIG.json";
 const MAX_EDIT_REQUEST_BYTES: u64 = 256 * 1024;
 
 fn main() -> ExitCode {
@@ -13,32 +13,45 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let (check, describe, describe_edit, plan_edit, apply_edit, qualify, supervised, path) =
-        if first == "--check"
-            || first == "--describe-providers"
-            || first == "--describe-provider-edit"
-            || first == "--plan-provider-edit"
-            || first == "--apply-provider-edit"
-            || first == "--qualify-provider"
-            || first == "--supervised"
-        {
-            let Some(path) = arguments.next() else {
-                eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            };
-            (
-                first == "--check",
-                first == "--describe-providers",
-                first == "--describe-provider-edit",
-                first == "--plan-provider-edit",
-                first == "--apply-provider-edit",
-                first == "--qualify-provider",
-                first == "--supervised",
-                path,
-            )
-        } else {
-            (false, false, false, false, false, false, false, first)
+    let (
+        check,
+        describe,
+        describe_edit,
+        plan_edit,
+        apply_edit,
+        qualify,
+        invoke_task,
+        supervised,
+        path,
+    ) = if first == "--check"
+        || first == "--describe-providers"
+        || first == "--describe-provider-edit"
+        || first == "--plan-provider-edit"
+        || first == "--apply-provider-edit"
+        || first == "--qualify-provider"
+        || first == "--invoke-task"
+        || first == "--supervised"
+    {
+        let Some(path) = arguments.next() else {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
         };
+        (
+            first == "--check",
+            first == "--describe-providers",
+            first == "--describe-provider-edit",
+            first == "--plan-provider-edit",
+            first == "--apply-provider-edit",
+            first == "--qualify-provider",
+            first == "--invoke-task",
+            first == "--supervised",
+            path,
+        )
+    } else {
+        (
+            false, false, false, false, false, false, false, false, first,
+        )
+    };
     if arguments.next().is_some() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -108,6 +121,29 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("local model provider qualification: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if invoke_task {
+        let mut request = Vec::new();
+        if io::stdin()
+            .lock()
+            .take(MAX_EDIT_REQUEST_BYTES + 1)
+            .read_to_end(&mut request)
+            .is_err()
+            || request.len() as u64 > MAX_EDIT_REQUEST_BYTES
+        {
+            eprintln!("local model task invocation: invalid bounded request");
+            return ExitCode::FAILURE;
+        }
+        return match daimon_local_model::invoke_task_json(&path, &request) {
+            Ok(receipt) => {
+                println!("{receipt}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("local model task invocation: {error}");
                 ExitCode::FAILURE
             }
         };
