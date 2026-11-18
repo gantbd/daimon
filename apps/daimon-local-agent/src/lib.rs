@@ -20,6 +20,10 @@ use daimon_host::{
     },
 };
 use daimon_local_daemon::unix::{AgentDaemon, Authenticator};
+use daimon_owner_document::{
+    DocumentErrorV1, EditLockV1, atomic_replace, plan_digest, read_bounded,
+    valid_digest as valid_owner_digest, valid_operation_id,
+};
 use daimon_process::{
     ProcessBoundaryExitV1, ProcessBoundaryLaunchV1, ProcessBoundaryV1, ProcessIsolationV1,
 };
@@ -32,13 +36,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs,
     io::{Read, Write},
     net::Shutdown,
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        net::UnixStream,
-    },
+    os::unix::net::UnixStream,
     path::{Component, Path, PathBuf},
     rc::Rc,
     sync::{
@@ -395,8 +396,6 @@ fn digest_text(bytes: [u8; 32]) -> String {
     text
 }
 
-const MAX_OWNER_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
-
 #[derive(Debug)]
 pub enum ProviderEditErrorV1 {
     Io,
@@ -574,7 +573,7 @@ pub fn apply_provider_edit_json(
     }
 
     let path = path.as_ref();
-    let _lock = EditLockV1::acquire(path, &request.operation_id)?;
+    let _lock = EditLockV1::acquire(path, ".provider-edit.lock").map_err(map_document_error)?;
     let (bytes, current) = read_owner_document(path)?;
     let current_digest = digest_text(Sha256::digest(&bytes).into());
     if current_digest == request.expected_candidate_document_digest {
@@ -595,7 +594,7 @@ pub fn apply_provider_edit_json(
     if candidate_digest != request.expected_candidate_document_digest {
         return Err(ProviderEditErrorV1::PlanMismatch);
     }
-    atomic_replace_owner_document(path, &request.operation_id, &candidate_bytes)?;
+    atomic_replace(path, &candidate_bytes).map_err(map_document_error)?;
     provider_edit_receipt(&request, false)
 }
 
@@ -626,34 +625,21 @@ fn validate_edit_header(
     operation_id: &str,
     document_digest: &str,
 ) -> Result<(), ProviderEditErrorV1> {
-    if version != 1
-        || operation_id.len() != 32
-        || !operation_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if version != 1 || !valid_operation_id(operation_id) {
         return Err(ProviderEditErrorV1::Invalid);
     }
     validate_digest(document_digest)
 }
 
 fn validate_digest(digest: &str) -> Result<(), ProviderEditErrorV1> {
-    let Some(hex) = digest.strip_prefix("sha256:") else {
-        return Err(ProviderEditErrorV1::Invalid);
-    };
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_owner_digest(digest) {
         return Err(ProviderEditErrorV1::Invalid);
     }
     Ok(())
 }
 
 fn read_owner_document(path: &Path) -> Result<(Vec<u8>, ConfigV1), ProviderEditErrorV1> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ProviderEditErrorV1::Io)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_OWNER_DOCUMENT_BYTES
-    {
-        return Err(ProviderEditErrorV1::Invalid);
-    }
-    let bytes = fs::read(path).map_err(|_| ProviderEditErrorV1::Io)?;
+    let bytes = read_bounded(path).map_err(map_document_error)?;
     let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ProviderEditErrorV1::Json)?;
     validate(raw.clone()).map_err(map_config_edit_error)?;
     Ok((bytes, raw))
@@ -679,17 +665,12 @@ fn candidate_document(
 }
 
 fn provider_edit_plan_digest(operation_id: &str, current: &str, candidate: &str) -> String {
-    let mut hasher = Sha256::new();
-    for part in [
-        b"daimon-local-agent/provider-edit/v1".as_slice(),
-        operation_id.as_bytes(),
-        current.as_bytes(),
-        candidate.as_bytes(),
-    ] {
-        hasher.update((part.len() as u64).to_be_bytes());
-        hasher.update(part);
-    }
-    digest_text(hasher.finalize().into())
+    plan_digest(
+        b"daimon-local-agent/provider-edit/v1",
+        operation_id,
+        current,
+        candidate,
+    )
 }
 
 fn changed_provider_fields(
@@ -759,79 +740,12 @@ fn map_config_edit_error(error: ConfigErrorV1) -> ProviderEditErrorV1 {
     }
 }
 
-struct EditLockV1 {
-    path: PathBuf,
-}
-
-impl EditLockV1 {
-    fn acquire(path: &Path, operation_id: &str) -> Result<Self, ProviderEditErrorV1> {
-        let lock_path = sibling_path(path, ".provider-edit.lock")?;
-        let mut lock = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&lock_path)
-        {
-            Ok(lock) => lock,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(ProviderEditErrorV1::Busy);
-            }
-            Err(_) => return Err(ProviderEditErrorV1::Io),
-        };
-        if lock.write_all(operation_id.as_bytes()).is_err() || lock.sync_all().is_err() {
-            let _ = fs::remove_file(&lock_path);
-            return Err(ProviderEditErrorV1::Io);
-        }
-        Ok(Self { path: lock_path })
+fn map_document_error(error: DocumentErrorV1) -> ProviderEditErrorV1 {
+    match error {
+        DocumentErrorV1::Io => ProviderEditErrorV1::Io,
+        DocumentErrorV1::Invalid => ProviderEditErrorV1::Invalid,
+        DocumentErrorV1::Busy => ProviderEditErrorV1::Busy,
     }
-}
-
-impl Drop for EditLockV1 {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn sibling_path(path: &Path, suffix: &str) -> Result<PathBuf, ProviderEditErrorV1> {
-    let name = path.file_name().ok_or(ProviderEditErrorV1::Invalid)?;
-    let mut sibling = OsString::from(name);
-    sibling.push(suffix);
-    Ok(path.with_file_name(sibling))
-}
-
-fn atomic_replace_owner_document(
-    path: &Path,
-    operation_id: &str,
-    bytes: &[u8],
-) -> Result<(), ProviderEditErrorV1> {
-    let temporary_path = sibling_path(path, &format!(".provider-edit-{operation_id}.tmp"))?;
-    let permissions = fs::metadata(path)
-        .map_err(|_| ProviderEditErrorV1::Io)?
-        .permissions()
-        .mode();
-    let result = (|| {
-        let mut temporary = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(permissions)
-            .open(&temporary_path)
-            .map_err(|_| ProviderEditErrorV1::Io)?;
-        temporary
-            .write_all(bytes)
-            .map_err(|_| ProviderEditErrorV1::Io)?;
-        temporary.sync_all().map_err(|_| ProviderEditErrorV1::Io)?;
-        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(permissions))
-            .map_err(|_| ProviderEditErrorV1::Io)?;
-        fs::rename(&temporary_path, path).map_err(|_| ProviderEditErrorV1::Io)?;
-        let parent = path.parent().ok_or(ProviderEditErrorV1::Invalid)?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| ProviderEditErrorV1::Io)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
 }
 
 #[derive(Clone)]

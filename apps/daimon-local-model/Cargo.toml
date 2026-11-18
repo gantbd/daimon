@@ -23,6 +23,7 @@ daimon-harness = { path = "../.." }
 daimon-host = { path = "../../crates/daimon-host" }
 daimon-local = { path = "../../adapters/daimon-local" }
 daimon-local-daemon = { path = "../../crates/daimon-local-daemon" }
+daimon-owner-document = { path = "../../crates/daimon-owner-document" }
 daimon-openai-local = { path = "../../adapters/daimon-openai-local" }
 daimon-protocol = { path = "../../crates/daimon-protocol" }
 daimon-service = { path = "../../crates/daimon-service" }

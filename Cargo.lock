@@ -314,6 +314,7 @@ dependencies = [
  "daimon-host",
  "daimon-local",
  "daimon-local-daemon",
+ "daimon-owner-document",
  "daimon-process",
  "daimon-protocol",
  "daimon-service",
@@ -359,6 +360,7 @@ dependencies = [
  "daimon-local",
  "daimon-local-daemon",
  "daimon-openai-local",
+ "daimon-owner-document",
  "daimon-protocol",
  "daimon-service",
  "daimon-wire",
@@ -375,6 +377,13 @@ dependencies = [
  "daimon-protocol",
  "serde",
  "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "daimon-owner-document"
+version = "0.1.0"
+dependencies = [
  "sha2",
 ]
 

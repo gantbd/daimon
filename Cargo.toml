@@ -32,6 +32,7 @@ members = [
   "crates/daimon-agent-command",
   "crates/daimon-host",
   "crates/daimon-local-daemon",
+  "crates/daimon-owner-document",
   "crates/daimon-process",
   "crates/daimon-protocol",
   "crates/daimon-service",

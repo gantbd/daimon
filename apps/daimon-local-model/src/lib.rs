@@ -20,6 +20,10 @@ use daimon_openai_local::{
     EndpointV1, LocalProfileV1, OpenAiCompatibleProvider, ResponseModeV1, StaticProfileResolver,
     profile_document_digest,
 };
+use daimon_owner_document::{
+    DocumentErrorV1, EditLockV1, atomic_replace, digest_bytes, plan_digest, read_bounded,
+    valid_digest as valid_owner_digest, valid_operation_id,
+};
 use daimon_protocol as protocol;
 use daimon_service::{ServiceLimitsV1, model::ModelService};
 use serde::{Deserialize, Serialize};
@@ -46,7 +50,7 @@ const MAX_QUALIFICATION_RECORDS: usize = 32;
 const QUALIFICATION_PROMPT: &[u8] = b"Respond with a short confirmation that this local model can complete a bounded request. Do not request tools or propose external effects.";
 static NEXT_QUALIFICATION_WRITE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigV1 {
     pub principal: String,
@@ -75,7 +79,7 @@ pub struct ConfigV1 {
     pub max_requests_per_connection: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfigV1 {
     pub provider_id: String,
@@ -103,14 +107,14 @@ pub struct ProviderConfigV1 {
     pub max_response_bytes: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskBindingConfigV1 {
     pub external_task_key: String,
     pub chronos_task_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextConfigV1 {
     pub reference: String,
@@ -122,7 +126,7 @@ pub struct ContextConfigV1 {
     pub dendrite: Option<DendriteBindingConfigV1>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextKindConfigV1 {
     AgoraMessage,
@@ -130,7 +134,7 @@ pub enum ContextKindConfigV1 {
     VellumDocument,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DendriteBindingConfigV1 {
     pub load_id: String,
@@ -140,7 +144,7 @@ pub struct DendriteBindingConfigV1 {
     pub expected_surface_digest: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroundingDepthConfigV1 {
     Ambient,
@@ -148,7 +152,7 @@ pub enum GroundingDepthConfigV1 {
     Reference,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DendriteConfigV1 {
     pub address: String,
@@ -167,14 +171,14 @@ pub struct DendriteConfigV1 {
     pub max_context_bytes: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageConfigV1 {
     pub role: MessageRoleConfigV1,
     pub content: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRoleConfigV1 {
     System,
@@ -353,6 +357,378 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
     .map_err(|_| ConfigErrorV1::Json)
 }
 
+#[derive(Debug)]
+pub enum ProviderEditErrorV1 {
+    Io,
+    Json,
+    Invalid,
+    Conflict,
+    PlanMismatch,
+    Busy,
+    NoChange,
+}
+
+impl std::fmt::Display for ProviderEditErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let orientation = match self {
+            Self::Io => "owner document could not be read or replaced",
+            Self::Json => "request or owner document is not valid JSON",
+            Self::Invalid => "request or candidate owner document is invalid",
+            Self::Conflict => "owner document changed; refresh and review a new plan",
+            Self::PlanMismatch => "confirmation does not match the reviewed plan",
+            Self::Busy => "another provider edit is in progress; try again after it completes",
+            Self::NoChange => {
+                "provider already matches the requested configuration; no apply is needed"
+            }
+        };
+        write!(formatter, "provider edit: {orientation}")
+    }
+}
+
+impl std::error::Error for ProviderEditErrorV1 {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderEditPlanRequestV1 {
+    version: u8,
+    operation_id: String,
+    expected_document_digest: String,
+    provider: ProviderConfigV1,
+}
+
+#[derive(Serialize)]
+struct ProviderEditFormV1<'a> {
+    version: u8,
+    owner: &'static str,
+    document_digest: String,
+    provider: &'a ProviderConfigV1,
+    secret_values_projected: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderEditApplyRequestV1 {
+    version: u8,
+    operation_id: String,
+    expected_document_digest: String,
+    expected_plan_digest: String,
+    expected_candidate_document_digest: String,
+    provider: ProviderConfigV1,
+}
+
+#[derive(Serialize)]
+struct ProviderEditPlanV1 {
+    version: u8,
+    owner: &'static str,
+    operation_id: String,
+    action: &'static str,
+    expected_document_digest: String,
+    current_document_digest: String,
+    candidate_document_digest: String,
+    plan_digest: String,
+    provider: ModelProviderEditProjectionV1,
+    changed_fields: Vec<&'static str>,
+    restart_required: bool,
+    qualification_required: bool,
+}
+
+#[derive(Serialize)]
+struct ModelProviderEditProjectionV1 {
+    provider_id: String,
+    harness_profile_id: String,
+    profile_document_digest: String,
+    wire: &'static str,
+    model: String,
+    endpoint_scope: &'static str,
+    endpoint_port: u16,
+    structured_output: bool,
+    structured_tools: bool,
+    sampling_temperature_milli: u16,
+    bearer_token_configured: bool,
+}
+
+#[derive(Serialize)]
+struct ProviderEditReceiptV1 {
+    version: u8,
+    owner: &'static str,
+    operation_id: String,
+    disposition: &'static str,
+    applied: bool,
+    replayed: bool,
+    document_digest: String,
+    provider_id: String,
+    restart_required: bool,
+    qualification_required: bool,
+}
+
+/// Returns the exact non-secret editable provider fields for a deliberate
+/// configuration surface. A credential environment variable name may be
+/// projected; its value is never read into or returned by this contract.
+pub fn provider_edit_form_json(path: impl AsRef<Path>) -> Result<String, ProviderEditErrorV1> {
+    let (bytes, current) = read_owner_document(path.as_ref())?;
+    serde_json::to_string(&ProviderEditFormV1 {
+        version: 1,
+        owner: "daimon-local-model",
+        document_digest: digest_bytes(&bytes),
+        provider: &current.provider,
+        secret_values_projected: false,
+    })
+    .map_err(|_| ProviderEditErrorV1::Json)
+}
+
+/// Produces a redacted, digest-bound replacement plan for the one selected
+/// local-model provider. Endpoint host, path, and credential name remain in the
+/// owner document and are never projected by the plan.
+pub fn plan_provider_edit_json(
+    path: impl AsRef<Path>,
+    request: &[u8],
+) -> Result<String, ProviderEditErrorV1> {
+    let request: ProviderEditPlanRequestV1 =
+        serde_json::from_slice(request).map_err(|_| ProviderEditErrorV1::Json)?;
+    validate_edit_header(
+        request.version,
+        &request.operation_id,
+        &request.expected_document_digest,
+    )?;
+    let path = path.as_ref();
+    let (bytes, current) = read_owner_document(path)?;
+    let current_digest = digest_bytes(&bytes);
+    if current_digest != request.expected_document_digest {
+        return Err(ProviderEditErrorV1::Conflict);
+    }
+    if current.provider == request.provider {
+        return Err(ProviderEditErrorV1::NoChange);
+    }
+    let existing = current.provider.clone();
+    let (candidate, candidate_bytes) = candidate_document(current, request.provider.clone())?;
+    let candidate_digest = digest_bytes(&candidate_bytes);
+    let plan_digest =
+        provider_edit_plan_digest(&request.operation_id, &current_digest, &candidate_digest);
+    let validated = validate_owner_document(candidate.clone()).map_err(map_config_edit_error)?;
+    serde_json::to_string(&ProviderEditPlanV1 {
+        version: 1,
+        owner: "daimon-local-model",
+        operation_id: request.operation_id,
+        action: "replace",
+        expected_document_digest: request.expected_document_digest,
+        current_document_digest: current_digest,
+        candidate_document_digest: candidate_digest,
+        plan_digest,
+        provider: model_provider_edit_projection(&candidate.provider, &validated),
+        changed_fields: changed_provider_fields(&existing, &candidate.provider),
+        restart_required: true,
+        qualification_required: true,
+    })
+    .map_err(|_| ProviderEditErrorV1::Json)
+}
+
+/// Applies only the byte-exact provider replacement previously planned by this
+/// owner. Same-operation replay verifies the candidate and does not rewrite it.
+pub fn apply_provider_edit_json(
+    path: impl AsRef<Path>,
+    request: &[u8],
+) -> Result<String, ProviderEditErrorV1> {
+    let request: ProviderEditApplyRequestV1 =
+        serde_json::from_slice(request).map_err(|_| ProviderEditErrorV1::Json)?;
+    validate_edit_header(
+        request.version,
+        &request.operation_id,
+        &request.expected_document_digest,
+    )?;
+    if !valid_owner_digest(&request.expected_plan_digest)
+        || !valid_owner_digest(&request.expected_candidate_document_digest)
+        || provider_edit_plan_digest(
+            &request.operation_id,
+            &request.expected_document_digest,
+            &request.expected_candidate_document_digest,
+        ) != request.expected_plan_digest
+    {
+        return Err(ProviderEditErrorV1::PlanMismatch);
+    }
+
+    let path = path.as_ref();
+    let _lock = EditLockV1::acquire(path, ".provider-edit.lock").map_err(map_document_error)?;
+    let (bytes, current) = read_owner_document(path)?;
+    let current_digest = digest_bytes(&bytes);
+    if current_digest == request.expected_candidate_document_digest {
+        if current.provider != request.provider {
+            return Err(ProviderEditErrorV1::PlanMismatch);
+        }
+        return provider_edit_receipt(&request, true);
+    }
+    if current_digest != request.expected_document_digest {
+        return Err(ProviderEditErrorV1::Conflict);
+    }
+    let (_, candidate_bytes) = candidate_document(current, request.provider.clone())?;
+    if digest_bytes(&candidate_bytes) != request.expected_candidate_document_digest {
+        return Err(ProviderEditErrorV1::PlanMismatch);
+    }
+    atomic_replace(path, &candidate_bytes).map_err(map_document_error)?;
+    provider_edit_receipt(&request, false)
+}
+
+fn provider_edit_receipt(
+    request: &ProviderEditApplyRequestV1,
+    replayed: bool,
+) -> Result<String, ProviderEditErrorV1> {
+    serde_json::to_string(&ProviderEditReceiptV1 {
+        version: 1,
+        owner: "daimon-local-model",
+        operation_id: request.operation_id.clone(),
+        disposition: if replayed {
+            "already_applied"
+        } else {
+            "applied"
+        },
+        applied: true,
+        replayed,
+        document_digest: request.expected_candidate_document_digest.clone(),
+        provider_id: request.provider.provider_id.clone(),
+        restart_required: true,
+        qualification_required: true,
+    })
+    .map_err(|_| ProviderEditErrorV1::Json)
+}
+
+fn validate_edit_header(
+    version: u8,
+    operation_id: &str,
+    document_digest: &str,
+) -> Result<(), ProviderEditErrorV1> {
+    if version != 1 || !valid_operation_id(operation_id) || !valid_owner_digest(document_digest) {
+        return Err(ProviderEditErrorV1::Invalid);
+    }
+    Ok(())
+}
+
+fn read_owner_document(path: &Path) -> Result<(Vec<u8>, ConfigV1), ProviderEditErrorV1> {
+    let bytes = read_bounded(path).map_err(map_document_error)?;
+    let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ProviderEditErrorV1::Json)?;
+    validate_owner_document(raw.clone()).map_err(map_config_edit_error)?;
+    Ok((bytes, raw))
+}
+
+fn candidate_document(
+    mut current: ConfigV1,
+    provider: ProviderConfigV1,
+) -> Result<(ConfigV1, Vec<u8>), ProviderEditErrorV1> {
+    current.provider = provider;
+    validate_owner_document(current.clone()).map_err(map_config_edit_error)?;
+    let mut bytes = serde_json::to_vec_pretty(&current).map_err(|_| ProviderEditErrorV1::Json)?;
+    bytes.push(b'\n');
+    Ok((current, bytes))
+}
+
+fn provider_edit_plan_digest(operation_id: &str, current: &str, candidate: &str) -> String {
+    plan_digest(
+        b"daimon-local-model/provider-edit/v1",
+        operation_id,
+        current,
+        candidate,
+    )
+}
+
+fn changed_provider_fields(
+    existing: &ProviderConfigV1,
+    candidate: &ProviderConfigV1,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if existing.provider_id != candidate.provider_id {
+        fields.push("provider_id");
+    }
+    if existing.harness_profile_id != candidate.harness_profile_id {
+        fields.push("harness_profile_id");
+    }
+    if existing.model != candidate.model {
+        fields.push("model");
+    }
+    if existing.address != candidate.address {
+        fields.push("address");
+    }
+    if existing.host_header != candidate.host_header {
+        fields.push("host_header");
+    }
+    if existing.path != candidate.path {
+        fields.push("path");
+    }
+    if existing.bearer_token_env != candidate.bearer_token_env {
+        fields.push("bearer_token_environment");
+    }
+    if existing.structured_output != candidate.structured_output {
+        fields.push("structured_output");
+    }
+    if existing.structured_tools != candidate.structured_tools {
+        fields.push("structured_tools");
+    }
+    if existing.sampling_temperature_milli != candidate.sampling_temperature_milli {
+        fields.push("sampling_temperature_milli");
+    }
+    if existing.connect_timeout_ms != candidate.connect_timeout_ms {
+        fields.push("connect_timeout_ms");
+    }
+    if existing.io_timeout_ms != candidate.io_timeout_ms {
+        fields.push("io_timeout_ms");
+    }
+    if existing.max_request_bytes != candidate.max_request_bytes {
+        fields.push("max_request_bytes");
+    }
+    if existing.max_response_bytes != candidate.max_response_bytes {
+        fields.push("max_response_bytes");
+    }
+    fields
+}
+
+fn model_provider_edit_projection(
+    provider: &ProviderConfigV1,
+    validated: &ValidatedConfigV1,
+) -> ModelProviderEditProjectionV1 {
+    let address = validated.profile.endpoint.address;
+    ModelProviderEditProjectionV1 {
+        provider_id: provider.provider_id.clone(),
+        harness_profile_id: provider.harness_profile_id.clone(),
+        profile_document_digest: digest_text(
+            validated.profile.snapshot.document_digest.into_bytes(),
+        ),
+        wire: "openai_chat_completions",
+        model: provider.model.clone(),
+        endpoint_scope: endpoint_scope(address),
+        endpoint_port: address.port(),
+        structured_output: provider.structured_output,
+        structured_tools: provider.structured_tools,
+        sampling_temperature_milli: provider.sampling_temperature_milli,
+        bearer_token_configured: provider.bearer_token_env.is_some(),
+    }
+}
+
+fn endpoint_scope(address: SocketAddr) -> &'static str {
+    if address.ip().is_loopback() {
+        "loopback"
+    } else if match address.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private(),
+        std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+    } {
+        "private_network"
+    } else {
+        "public_network"
+    }
+}
+
+fn map_config_edit_error(error: ConfigErrorV1) -> ProviderEditErrorV1 {
+    match error {
+        ConfigErrorV1::Io => ProviderEditErrorV1::Io,
+        ConfigErrorV1::Json => ProviderEditErrorV1::Json,
+        ConfigErrorV1::Invalid | ConfigErrorV1::SecretUnavailable => ProviderEditErrorV1::Invalid,
+    }
+}
+
+fn map_document_error(error: DocumentErrorV1) -> ProviderEditErrorV1 {
+    match error {
+        DocumentErrorV1::Io => ProviderEditErrorV1::Io,
+        DocumentErrorV1::Invalid => ProviderEditErrorV1::Invalid,
+        DocumentErrorV1::Busy => ProviderEditErrorV1::Busy,
+    }
+}
+
 /// Executes one bounded, non-retried completion-conformance request and retains
 /// the redacted result under the owner store's sibling qualification directory.
 /// The operation marker is committed before provider dispatch; replay returns
@@ -381,6 +757,7 @@ pub fn qualify_provider_json(
     let lock_path = directory.join("owner.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
@@ -659,6 +1036,17 @@ pub fn load(path: impl AsRef<Path>) -> Result<ValidatedConfigV1, ConfigErrorV1> 
 }
 
 pub fn validate(raw: ConfigV1) -> Result<ValidatedConfigV1, ConfigErrorV1> {
+    validate_with_secret_resolution(raw, true)
+}
+
+fn validate_owner_document(raw: ConfigV1) -> Result<ValidatedConfigV1, ConfigErrorV1> {
+    validate_with_secret_resolution(raw, false)
+}
+
+fn validate_with_secret_resolution(
+    raw: ConfigV1,
+    resolve_secrets: bool,
+) -> Result<ValidatedConfigV1, ConfigErrorV1> {
     let principal = hex_id(&raw.principal)?;
     if raw.io_timeout_ms == 0
         || raw.max_executions == 0
@@ -674,7 +1062,7 @@ pub fn validate(raw: ConfigV1) -> Result<ValidatedConfigV1, ConfigErrorV1> {
     if raw.provider.model.is_empty() || raw.provider.model.len() > 1_024 {
         return Err(ConfigErrorV1::Invalid);
     }
-    let bearer_token = secret(&raw.provider.bearer_token_env)?;
+    let bearer_token = secret(&raw.provider.bearer_token_env, resolve_secrets)?;
     let endpoint = EndpointV1 {
         address: SocketAddr::from_str(&raw.provider.address).map_err(|_| ConfigErrorV1::Invalid)?,
         host_header: raw.provider.host_header.clone(),
@@ -725,7 +1113,7 @@ pub fn validate(raw: ConfigV1) -> Result<ValidatedConfigV1, ConfigErrorV1> {
     if tools.iter().collect::<BTreeSet<_>>().len() != tools.len() {
         return Err(ConfigErrorV1::Invalid);
     }
-    let context = RuntimeContext::try_new(&raw)?;
+    let context = RuntimeContext::try_new(&raw, resolve_secrets)?;
     Ok(ValidatedConfigV1 {
         raw,
         principal,
@@ -873,7 +1261,7 @@ enum RuntimeContext {
 }
 
 impl RuntimeContext {
-    fn try_new(config: &ConfigV1) -> Result<Self, ConfigErrorV1> {
+    fn try_new(config: &ConfigV1, resolve_secrets: bool) -> Result<Self, ConfigErrorV1> {
         let messages = configured_messages(&config.messages)?;
         let has_dendrite = config.context.iter().any(|item| item.dendrite.is_some());
         if has_dendrite != config.dendrite.is_some() {
@@ -886,7 +1274,7 @@ impl RuntimeContext {
             )?));
         }
         let dendrite = config.dendrite.as_ref().ok_or(ConfigErrorV1::Invalid)?;
-        let token = secret(&dendrite.bearer_token_env)?;
+        let token = secret(&dendrite.bearer_token_env, resolve_secrets)?;
         let client = StreamableHttpClient::try_new(McpEndpointV1 {
             address: dendrite
                 .address
@@ -1099,13 +1487,14 @@ fn digest(value: &str) -> Result<protocol::ContentDigestV1, ConfigErrorV1> {
     Ok(protocol::ContentDigestV1::new(output))
 }
 
-fn secret(name: &Option<String>) -> Result<Option<Vec<u8>>, ConfigErrorV1> {
+fn secret(name: &Option<String>, resolve_secrets: bool) -> Result<Option<Vec<u8>>, ConfigErrorV1> {
     match name {
-        Some(name) if valid_env_name(name) => Ok(Some(
+        Some(name) if valid_env_name(name) && resolve_secrets => Ok(Some(
             std::env::var_os(name)
                 .ok_or(ConfigErrorV1::SecretUnavailable)?
                 .into_encoded_bytes(),
         )),
+        Some(name) if valid_env_name(name) => Ok(None),
         Some(_) => Err(ConfigErrorV1::Invalid),
         None => Ok(None),
     }
