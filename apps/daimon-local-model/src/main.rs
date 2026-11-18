@@ -1,7 +1,10 @@
-use std::{env, io, process::ExitCode};
+use std::{
+    env,
+    io::{self, Read},
+    process::ExitCode,
+};
 
-const USAGE: &str =
-    "usage: daimon-local-model [--check | --describe-providers | --supervised] CONFIG.json";
+const USAGE: &str = "usage: daimon-local-model [--check | --describe-providers | --qualify-provider | --supervised] CONFIG.json";
 
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
@@ -9,21 +12,25 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let (check, describe, supervised, path) =
-        if first == "--check" || first == "--describe-providers" || first == "--supervised" {
-            let Some(path) = arguments.next() else {
-                eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            };
-            (
-                first == "--check",
-                first == "--describe-providers",
-                first == "--supervised",
-                path,
-            )
-        } else {
-            (false, false, false, first)
+    let (check, describe, qualify, supervised, path) = if first == "--check"
+        || first == "--describe-providers"
+        || first == "--qualify-provider"
+        || first == "--supervised"
+    {
+        let Some(path) = arguments.next() else {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
         };
+        (
+            first == "--check",
+            first == "--describe-providers",
+            first == "--qualify-provider",
+            first == "--supervised",
+            path,
+        )
+    } else {
+        (false, false, false, false, first)
+    };
     if arguments.next().is_some() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -36,6 +43,23 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if qualify {
+        let mut request = Vec::new();
+        if io::stdin().read_to_end(&mut request).is_err() || request.len() > 64 * 1024 {
+            eprintln!("local model provider qualification: invalid bounded request");
+            return ExitCode::FAILURE;
+        }
+        return match daimon_local_model::qualify_provider_json(&path, &request) {
+            Ok(receipt) => {
+                println!("{receipt}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("local model provider qualification: {error}");
                 ExitCode::FAILURE
             }
         };

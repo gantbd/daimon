@@ -13,6 +13,7 @@ use daimon_dendrite::{
 };
 use daimon_host::{
     AssembledModelInputV1, AuthenticatedSessionV1, ContextAssembler, ContextRefusalV1,
+    ModelProvider, ModelProviderOutcomeV1,
 };
 use daimon_local_daemon::unix::{Authenticator, ModelDaemon};
 use daimon_openai_local::{
@@ -26,19 +27,24 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
-    fs,
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::{Shutdown, SocketAddr},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+const MAX_QUALIFICATION_RECORDS: usize = 32;
+const QUALIFICATION_PROMPT: &[u8] = b"Respond with a short confirmation that this local model can complete a bounded request. Do not request tools or propose external effects.";
+static NEXT_QUALIFICATION_WRITE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -240,6 +246,40 @@ struct ProviderCatalogEntryV1<'a> {
     structured_tools: bool,
     sampling_temperature_milli: u16,
     bearer_token_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualification: Option<ProviderQualificationProjectionV1>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderQualificationRequestV1 {
+    pub version: u8,
+    pub operation_id: String,
+    pub expected_document_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderQualificationProjectionV1 {
+    version: u8,
+    owner: String,
+    operation_id: String,
+    document_digest: String,
+    profile_document_digest: String,
+    provider_id: String,
+    harness_profile_id: String,
+    model: String,
+    host_observed_at_unix_ms: u64,
+    disposition: String,
+    completion: bool,
+    tool_continuation: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    output_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_digest: Option<String>,
+    known_deviations: Vec<String>,
+    replayed: bool,
 }
 
 /// Returns a bounded, redacted projection after validating the complete owner
@@ -259,10 +299,11 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
     } else {
         "public_network"
     };
+    let document_digest = digest_text(Sha256::digest(&bytes).into());
     serde_json::to_string(&ProviderCatalogV1 {
         version: 1,
         owner: "daimon-local-model",
-        document_digest: digest_text(Sha256::digest(&bytes).into()),
+        document_digest: document_digest.clone(),
         providers: [ProviderCatalogEntryV1 {
             provider_id: &validated.raw.provider.provider_id,
             harness_profile_id: &validated.raw.provider.harness_profile_id,
@@ -277,6 +318,7 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
             structured_tools: validated.raw.provider.structured_tools,
             sampling_temperature_milli: validated.raw.provider.sampling_temperature_milli,
             bearer_token_configured: validated.raw.provider.bearer_token_env.is_some(),
+            qualification: latest_provider_qualification(&validated, &document_digest),
         }],
         task_bindings: validated
             .raw
@@ -309,6 +351,295 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
             .collect(),
     })
     .map_err(|_| ConfigErrorV1::Json)
+}
+
+/// Executes one bounded, non-retried completion-conformance request and retains
+/// the redacted result under the owner store's sibling qualification directory.
+/// The operation marker is committed before provider dispatch; replay returns
+/// the retained receipt or an explicit outcome-unknown record and never sends a
+/// second provider request.
+pub fn qualify_provider_json(
+    path: impl AsRef<Path>,
+    request_bytes: &[u8],
+) -> Result<String, ConfigErrorV1> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|_| ConfigErrorV1::Io)?;
+    let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ConfigErrorV1::Json)?;
+    let validated = validate(raw)?;
+    let request: ProviderQualificationRequestV1 =
+        serde_json::from_slice(request_bytes).map_err(|_| ConfigErrorV1::Json)?;
+    let document_digest = digest_text(Sha256::digest(&bytes).into());
+    if request.version != 1
+        || hex_id(&request.operation_id).is_err()
+        || request.expected_document_digest != document_digest
+    {
+        return Err(ConfigErrorV1::Invalid);
+    }
+
+    let directory = qualification_directory(&validated.raw.store_directory);
+    create_private_qualification_directory(&directory)?;
+    let lock_path = directory.join("owner.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)
+        .map_err(|_| ConfigErrorV1::Io)?;
+    lock.try_lock().map_err(|_| ConfigErrorV1::Io)?;
+    let record_path = directory.join(format!("{}.json", request.operation_id));
+    if record_path.exists() {
+        let mut retained = read_qualification(&record_path)?;
+        validate_qualification_identity(&retained, &validated, &document_digest, &request)?;
+        if retained.disposition == "running" {
+            retained.disposition = "outcome_unknown".into();
+            retained.known_deviations =
+                vec!["provider_outcome_requires_operator_reconciliation".into()];
+            write_qualification_atomic(&record_path, &retained)?;
+        }
+        retained.replayed = true;
+        return serde_json::to_string(&retained).map_err(|_| ConfigErrorV1::Json);
+    }
+    let record_count = fs::read_dir(&directory)
+        .map_err(|_| ConfigErrorV1::Io)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json")
+        })
+        .count();
+    if record_count >= MAX_QUALIFICATION_RECORDS {
+        return Err(ConfigErrorV1::Invalid);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ConfigErrorV1::Invalid)?;
+    let host_observed_at_unix_ms =
+        u64::try_from(now.as_millis()).map_err(|_| ConfigErrorV1::Invalid)?;
+    let mut record = qualification_record(
+        &validated,
+        &request,
+        document_digest,
+        host_observed_at_unix_ms,
+    );
+    write_qualification_new(&record_path, &record)?;
+
+    let operation = hex_id(&request.operation_id)?;
+    let invocation = protocol::ModelInvocationV1 {
+        execution_id: protocol::ExecutionIdV1::new(operation),
+        provider: validated.profile.snapshot.clone(),
+        context: Vec::new(),
+        messages: vec![protocol::ModelMessageV1 {
+            role: protocol::MessageRoleV1::User,
+            content: QUALIFICATION_PROMPT.to_vec(),
+        }],
+        tools: Vec::new(),
+        continuation: None,
+        estimated_input_tokens: u64::try_from(QUALIFICATION_PROMPT.len().div_ceil(4))
+            .map_err(|_| ConfigErrorV1::Invalid)?,
+    };
+    let mut provider = OpenAiCompatibleProvider::try_new(std::slice::from_ref(&validated.profile))
+        .ok_or(ConfigErrorV1::Invalid)?;
+    match provider.execute_model(&invocation) {
+        ModelProviderOutcomeV1::Receipt(receipt) => {
+            record.input_tokens = receipt.input_tokens;
+            record.output_tokens = receipt.output_tokens;
+            record.output_bytes = receipt.output.len();
+            record.evidence_digest = Some(digest_text(receipt.evidence_digest.into_bytes()));
+            let completion = receipt.disposition == protocol::ExecutionDispositionV1::Completed
+                && !receipt.output.is_empty()
+                && receipt.input_tokens > 0
+                && receipt.output_tokens > 0
+                && receipt.proposals.is_empty();
+            record.completion = completion;
+            record.disposition = if completion {
+                "qualified_completion".into()
+            } else {
+                "nonconformant".into()
+            };
+            if !completion {
+                record.known_deviations.push(
+                    "completion, usage, output, or no-effect-proposal invariant was not met".into(),
+                );
+            }
+        }
+        ModelProviderOutcomeV1::OutcomeUnknown => {
+            record.disposition = "outcome_unknown".into();
+            record
+                .known_deviations
+                .push("provider outcome requires operator reconciliation".into());
+        }
+    }
+    write_qualification_atomic(&record_path, &record)?;
+    serde_json::to_string(&record).map_err(|_| ConfigErrorV1::Json)
+}
+
+fn qualification_directory(store: &Path) -> PathBuf {
+    let mut value = store.as_os_str().to_os_string();
+    value.push(".provider-qualifications");
+    PathBuf::from(value)
+}
+
+fn create_private_qualification_directory(path: &Path) -> Result<(), ConfigErrorV1> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|_| ConfigErrorV1::Io)?;
+            if metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0 {
+                Ok(())
+            } else {
+                Err(ConfigErrorV1::Invalid)
+            }
+        }
+        Err(_) => Err(ConfigErrorV1::Io),
+    }
+}
+
+fn qualification_record(
+    config: &ValidatedConfigV1,
+    request: &ProviderQualificationRequestV1,
+    document_digest: String,
+    host_observed_at_unix_ms: u64,
+) -> ProviderQualificationProjectionV1 {
+    ProviderQualificationProjectionV1 {
+        version: 1,
+        owner: "daimon-local-model".into(),
+        operation_id: request.operation_id.clone(),
+        document_digest,
+        profile_document_digest: digest_text(config.profile.snapshot.document_digest.into_bytes()),
+        provider_id: config.raw.provider.provider_id.clone(),
+        harness_profile_id: config.raw.provider.harness_profile_id.clone(),
+        model: config.raw.provider.model.clone(),
+        host_observed_at_unix_ms,
+        disposition: "running".into(),
+        completion: false,
+        tool_continuation: "not_exercised".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+        output_bytes: 0,
+        evidence_digest: None,
+        known_deviations: vec!["tool_continuation_not_exercised".into()],
+        replayed: false,
+    }
+}
+
+fn validate_qualification_identity(
+    record: &ProviderQualificationProjectionV1,
+    config: &ValidatedConfigV1,
+    document_digest: &str,
+    request: &ProviderQualificationRequestV1,
+) -> Result<(), ConfigErrorV1> {
+    if record.version == 1
+        && record.owner == "daimon-local-model"
+        && record.operation_id == request.operation_id
+        && record.document_digest == document_digest
+        && record.profile_document_digest
+            == digest_text(config.profile.snapshot.document_digest.into_bytes())
+        && record.provider_id == config.raw.provider.provider_id
+        && record.harness_profile_id == config.raw.provider.harness_profile_id
+        && record.model == config.raw.provider.model
+    {
+        Ok(())
+    } else {
+        Err(ConfigErrorV1::Invalid)
+    }
+}
+
+fn write_qualification_new(
+    path: &Path,
+    record: &ProviderQualificationProjectionV1,
+) -> Result<(), ConfigErrorV1> {
+    let bytes = serde_json::to_vec(record).map_err(|_| ConfigErrorV1::Json)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| ConfigErrorV1::Io)?;
+    file.write_all(&bytes).map_err(|_| ConfigErrorV1::Io)?;
+    file.sync_all().map_err(|_| ConfigErrorV1::Io)?;
+    File::open(path.parent().ok_or(ConfigErrorV1::Invalid)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ConfigErrorV1::Io)
+}
+
+fn write_qualification_atomic(
+    path: &Path,
+    record: &ProviderQualificationProjectionV1,
+) -> Result<(), ConfigErrorV1> {
+    let temporary = path.with_extension(format!(
+        "json.next-{}-{}",
+        std::process::id(),
+        NEXT_QUALIFICATION_WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
+    if temporary.exists() {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    write_qualification_new(&temporary, record)?;
+    fs::rename(&temporary, path).map_err(|_| ConfigErrorV1::Io)?;
+    File::open(path.parent().ok_or(ConfigErrorV1::Invalid)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ConfigErrorV1::Io)
+}
+
+fn read_qualification(path: &Path) -> Result<ProviderQualificationProjectionV1, ConfigErrorV1> {
+    let bytes = fs::read(path).map_err(|_| ConfigErrorV1::Io)?;
+    if bytes.len() > 64 * 1024 {
+        return Err(ConfigErrorV1::Invalid);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ConfigErrorV1::Json)
+}
+
+fn latest_provider_qualification(
+    config: &ValidatedConfigV1,
+    document_digest: &str,
+) -> Option<ProviderQualificationProjectionV1> {
+    let directory = qualification_directory(&config.raw.store_directory);
+    let expected = digest_text(config.profile.snapshot.document_digest.into_bytes());
+    let mut records = fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| read_qualification(&entry.path()).ok())
+        .filter(|record| {
+            record.version == 1
+                && record.owner == "daimon-local-model"
+                && hex_id(&record.operation_id).is_ok()
+                && record.document_digest == document_digest
+                && record.profile_document_digest == expected
+                && record.provider_id == config.raw.provider.provider_id
+                && record.harness_profile_id == config.raw.provider.harness_profile_id
+                && record.model == config.raw.provider.model
+                && matches!(
+                    record.disposition.as_str(),
+                    "qualified_completion" | "nonconformant" | "outcome_unknown" | "running"
+                )
+                && record.completion == (record.disposition == "qualified_completion")
+                && record.tool_continuation == "not_exercised"
+                && record.known_deviations.len() <= 8
+                && record
+                    .known_deviations
+                    .iter()
+                    .all(|deviation| !deviation.is_empty() && deviation.len() <= 256)
+                && (!record.completion
+                    || (record.input_tokens > 0
+                        && record.output_tokens > 0
+                        && record.output_bytes > 0
+                        && record.evidence_digest.is_some()))
+        })
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.host_observed_at_unix_ms);
+    records.pop().map(|mut record| {
+        if record.disposition == "running" {
+            record.disposition = "outcome_unknown".into();
+            record.known_deviations =
+                vec!["provider outcome requires operator reconciliation".into()];
+        }
+        record.replayed = false;
+        record
+    })
 }
 
 fn digest_text(bytes: [u8; 32]) -> String {
