@@ -7,9 +7,9 @@
 
 use daimon_client::{AgentReadOnlyClient, AgentServicePort, AgentSessionClient};
 use daimon_protocol::agent::{
-    AgentEventV1, AgentOutcomeV1, AgentPermissionDecisionV1, AgentPermissionOptionKindV1,
-    AgentPermissionRequestV1, AgentRefusalV1, AgentReplyV1, AgentSessionPhaseV1,
-    AgentSessionViewV1, AgentTurnRequestV1,
+    AgentEventV1, AgentOpenRequestV1, AgentOutcomeV1, AgentPermissionDecisionV1,
+    AgentPermissionOptionKindV1, AgentPermissionRequestV1, AgentRefusalV1, AgentReplyV1,
+    AgentSessionBudgetV1, AgentSessionPhaseV1, AgentSessionViewV1, AgentTurnRequestV1,
 };
 use daimon_protocol::{
     AgentPermissionOptionIdV1, AgentPermissionRequestIdV1, AgentSessionIdV1, AgentTurnIdV1,
@@ -21,6 +21,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub const ADVANCE_CAPABILITY: &str = "agents.session.advance.v1";
+pub const OPEN_CAPABILITY: &str = "agents.session.open.v1";
 pub const PROMPT_CAPABILITY: &str = "agents.session.prompt.v1";
 pub const PERMISSION_CAPABILITY: &str = "agents.session.permission.v1";
 pub const CANCEL_CAPABILITY: &str = "agents.session.cancel.v1";
@@ -30,6 +31,105 @@ pub const CAPABILITY: &str = ADVANCE_CAPABILITY;
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub const MAX_CONTEXT_REFERENCES: usize = 64;
 pub const MAX_TOOLS: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenRequest {
+    pub session: AgentSessionIdV1,
+    pub execution: ExecuteRequestV1,
+    pub workspace: [u8; 16],
+    pub budget: AgentSessionBudgetV1,
+    pub now: u64,
+}
+
+impl OpenRequest {
+    pub fn confirmation(&self) -> String {
+        format!(
+            "OPEN DAIMON SESSION {} WORKSPACE {} ENVELOPE {} KEY {} BUDGET {} {} {} {} {} {} AT {}",
+            hex(&self.session.into_bytes()),
+            hex(&self.workspace),
+            hex(&digest_execution(&self.execution)),
+            hex(&self.execution.idempotency_key.into_bytes()),
+            self.budget.max_elapsed_millis,
+            self.budget.max_turns,
+            self.budget.max_events,
+            self.budget.max_event_bytes,
+            self.budget.max_prompt_bytes,
+            self.budget.max_permission_requests,
+            self.now,
+        )
+    }
+
+    fn owner_request(&self) -> AgentOpenRequestV1 {
+        AgentOpenRequestV1 {
+            session: self.session,
+            execution: self.execution.clone(),
+            workspace: self.workspace,
+            budget: self.budget,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum OpenError<E> {
+    InvalidRequest,
+    ConfirmationMismatch { required: String },
+    MutationTransport(E),
+    MutationRefused(AgentRefusalV1),
+    InvalidMutationReply,
+}
+
+/// Offers one exact new interactive-agent session to Daimon once. There is no
+/// pre-open session state to observe; stable session and idempotency identities
+/// provide replay semantics, and transport uncertainty is returned without a
+/// second dispatch.
+pub fn open<P: AgentServicePort>(
+    service_session: SessionHandleV1,
+    port: P,
+    request: OpenRequest,
+    confirmation: &str,
+) -> Result<AgentOutcomeV1, OpenError<P::Error>> {
+    if !valid_open_request(&request) {
+        return Err(OpenError::InvalidRequest);
+    }
+    let required = request.confirmation();
+    if confirmation != required {
+        return Err(OpenError::ConfirmationMismatch { required });
+    }
+    let expected_session = request.session;
+    let expected_key = request.execution.idempotency_key;
+    let now = request.now;
+    let mut operator = AgentSessionClient::new(service_session, port);
+    match operator.open(request.owner_request(), now) {
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view)))
+            if view.session == expected_session =>
+        {
+            Ok(AgentOutcomeV1::Session(view))
+        }
+        Ok(AgentReplyV1::Accepted(AgentOutcomeV1::OutcomeUnknown {
+            session,
+            idempotency_key,
+        })) if session == expected_session && idempotency_key == expected_key => {
+            Ok(AgentOutcomeV1::OutcomeUnknown {
+                session,
+                idempotency_key,
+            })
+        }
+        Ok(AgentReplyV1::Accepted(_)) => Err(OpenError::InvalidMutationReply),
+        Ok(AgentReplyV1::Refused(refusal)) => Err(OpenError::MutationRefused(refusal)),
+        Err(error) => Err(OpenError::MutationTransport(error)),
+    }
+}
+
+fn valid_open_request(request: &OpenRequest) -> bool {
+    request.execution.task_attempt.attempt_number != 0
+        && request.execution.context.len() <= MAX_CONTEXT_REFERENCES
+        && request.execution.tools.len() <= MAX_TOOLS
+        && request.budget.max_elapsed_millis != 0
+        && request.budget.max_turns != 0
+        && request.budget.max_events != 0
+        && request.budget.max_event_bytes != 0
+        && request.budget.max_prompt_bytes != 0
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptRequest {
@@ -305,6 +405,17 @@ struct PromptDocument {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OpenDocument {
+    schema: u8,
+    session: String,
+    workspace: String,
+    now: u64,
+    execution: ExecutionDocument,
+    budget: SessionBudgetDocument,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PermissionDocument {
     schema: u8,
     session: String,
@@ -350,6 +461,49 @@ struct BudgetDocument {
     max_tool_calls: u32,
     max_context_bytes: usize,
     max_output_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionBudgetDocument {
+    max_elapsed_millis: u64,
+    max_turns: u32,
+    max_events: u64,
+    max_event_bytes: usize,
+    max_prompt_bytes: usize,
+    max_permission_requests: u32,
+}
+
+/// Parses the strict, credential-free V1 session-open document shared by
+/// standalone Daimon and composing workbenches.
+pub fn parse_open_document(document: &[u8]) -> Result<OpenRequest, PromptDocumentError> {
+    let document: OpenDocument =
+        serde_json::from_slice(document).map_err(|_| PromptDocumentError::Malformed)?;
+    if document.schema != 1 {
+        return Err(PromptDocumentError::UnsupportedSchema);
+    }
+    if document.execution.context.len() > MAX_CONTEXT_REFERENCES
+        || document.execution.tools.len() > MAX_TOOLS
+    {
+        return Err(PromptDocumentError::Limit);
+    }
+    let request = OpenRequest {
+        session: AgentSessionIdV1::new(id16(&document.session)?),
+        execution: parse_execution(&document.execution)?,
+        workspace: id16(&document.workspace)?,
+        budget: AgentSessionBudgetV1 {
+            max_elapsed_millis: document.budget.max_elapsed_millis,
+            max_turns: document.budget.max_turns,
+            max_events: document.budget.max_events,
+            max_event_bytes: document.budget.max_event_bytes,
+            max_prompt_bytes: document.budget.max_prompt_bytes,
+            max_permission_requests: document.budget.max_permission_requests,
+        },
+        now: document.now,
+    };
+    valid_open_request(&request)
+        .then_some(request)
+        .ok_or(PromptDocumentError::Limit)
 }
 
 /// Parses the shared, credential-free V1 operator document used by standalone
@@ -1006,6 +1160,23 @@ mod tests {
         }
     }
 
+    fn open_request() -> OpenRequest {
+        OpenRequest {
+            session: prompt_request().session,
+            execution: prompt_request().execution,
+            workspace: [16; 16],
+            budget: AgentSessionBudgetV1 {
+                max_elapsed_millis: 60_000,
+                max_turns: 8,
+                max_events: 128,
+                max_event_bytes: 65_536,
+                max_prompt_bytes: 16_384,
+                max_permission_requests: 4,
+            },
+            now: 34,
+        }
+    }
+
     fn permission_request() -> PermissionRequest {
         PermissionRequest {
             session: AgentSessionIdV1::new([7; 16]),
@@ -1076,6 +1247,101 @@ mod tests {
             }],
             next_after: None,
         }
+    }
+
+    #[test]
+    fn exact_session_open_attempts_one_owner_mutation() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let mut ready = view(1, AgentSessionPhaseV1::Ready);
+        ready.active_turn = None;
+        assert_eq!(
+            open(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(
+                        ready.clone(),
+                    )))],
+                },
+                open_request(),
+                &open_request().confirmation(),
+            ),
+            Ok(AgentOutcomeV1::Session(ready))
+        );
+        let AgentCommandV1::Open { request, now } = &commands.borrow()[0] else {
+            panic!("open command expected");
+        };
+        assert_eq!(request.session, open_request().session);
+        assert_eq!(request.workspace, [16; 16]);
+        assert_eq!(*now, 34);
+        assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn session_open_confirmation_and_transport_uncertainty_never_redispatch() {
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        assert!(matches!(
+            open(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![],
+                },
+                open_request(),
+                "open",
+            ),
+            Err(OpenError::ConfirmationMismatch { .. })
+        ));
+        assert!(commands.borrow().is_empty());
+
+        assert_eq!(
+            open(
+                SessionHandleV1(4),
+                Port {
+                    commands: Rc::clone(&commands),
+                    replies: vec![Err("lost")],
+                },
+                open_request(),
+                &open_request().confirmation(),
+            ),
+            Err(OpenError::MutationTransport("lost"))
+        );
+        assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn session_open_document_is_bounded_and_exact() {
+        let document = br#"{
+            "schema":1,
+            "session":"07070707070707070707070707070707",
+            "workspace":"10101010101010101010101010101010",
+            "now":34,
+            "execution":{
+                "execution_id":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+                "task_key":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                "task_incarnation":4,
+                "attempt_number":2,
+                "principal":"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+                "profile":"0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d",
+                "idempotency_key":"09090909090909090909090909090909",
+                "context":["0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"],
+                "tools":["0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"],
+                "budget":{"max_elapsed_millis":1000,"max_input_tokens":100,"max_output_tokens":200,"max_tool_calls":3,"max_context_bytes":4096,"max_output_bytes":8192}
+            },
+            "budget":{"max_elapsed_millis":60000,"max_turns":8,"max_events":128,"max_event_bytes":65536,"max_prompt_bytes":16384,"max_permission_requests":4}
+        }"#;
+        let parsed = parse_open_document(document).unwrap();
+        assert_eq!(parsed.session, open_request().session);
+        assert_eq!(parsed.workspace, [16; 16]);
+        assert_eq!(parsed.budget.max_turns, 8);
+
+        let zero_turns = String::from_utf8(document.to_vec())
+            .unwrap()
+            .replace("\"max_turns\":8", "\"max_turns\":0");
+        assert_eq!(
+            parse_open_document(zero_turns.as_bytes()),
+            Err(PromptDocumentError::Limit)
+        );
     }
 
     #[test]
