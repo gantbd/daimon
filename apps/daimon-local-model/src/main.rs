@@ -3,21 +3,33 @@ use std::{env, process::ExitCode};
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
-        eprintln!("usage: daimon-local-model [--check] CONFIG.json");
+        eprintln!("usage: daimon-local-model [--check | --describe-providers] CONFIG.json");
         return ExitCode::from(2);
     };
-    let (check, path) = if first == "--check" {
+    let (check, describe, path) = if first == "--check" || first == "--describe-providers" {
         let Some(path) = arguments.next() else {
-            eprintln!("usage: daimon-local-model [--check] CONFIG.json");
+            eprintln!("usage: daimon-local-model [--check | --describe-providers] CONFIG.json");
             return ExitCode::from(2);
         };
-        (true, path)
+        (first == "--check", first == "--describe-providers", path)
     } else {
-        (false, first)
+        (false, false, first)
     };
     if arguments.next().is_some() {
-        eprintln!("usage: daimon-local-model [--check] CONFIG.json");
+        eprintln!("usage: daimon-local-model [--check | --describe-providers] CONFIG.json");
         return ExitCode::from(2);
+    }
+    if describe {
+        return match daimon_local_model::provider_catalog_json(path) {
+            Ok(catalog) => {
+                println!("{catalog}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let config = match daimon_local_model::load(path) {
         Ok(config) => config,

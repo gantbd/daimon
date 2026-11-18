@@ -340,6 +340,30 @@ fn write_resume_config(fixture: &Fixture) {
     fs::write(&fixture.config, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 }
 
+#[test]
+fn executable_projects_validated_provider_catalog_without_launch_material() {
+    let _journey = PROCESS_JOURNEY.lock().unwrap();
+    let fixture = Fixture::new();
+    write_config(&fixture);
+    let output = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
+        .arg("--describe-providers")
+        .arg(&fixture.config)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let catalog: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(catalog["version"], 1);
+    assert_eq!(catalog["owner"], "daimon-local-agent");
+    assert_eq!(catalog["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["providers"][0]["transport"], "acp");
+    assert_eq!(catalog["providers"][0]["executable_available"], true);
+    let projection = String::from_utf8(output.stdout).unwrap();
+    assert!(!projection.contains("/bin/sh"));
+    assert!(!projection.contains(fixture.root.to_str().unwrap()));
+    assert!(!projection.contains("inherited_environment_names"));
+    assert!(!projection.contains("arguments"));
+}
+
 fn start_agent(fixture: &Fixture) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_daimon-local-agent"))
         .arg("--supervised")

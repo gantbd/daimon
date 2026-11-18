@@ -25,7 +25,7 @@ use daimon_process::{
 };
 use daimon_protocol::{self as protocol, agent::*};
 use daimon_service::agent::{AgentService, AgentServiceLimitsV1};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
@@ -228,6 +228,78 @@ pub struct ValidatedConfigV1 {
     context: StaticAgentContext,
     file_read_scopes: Vec<AgentFileReadScopeV1>,
     terminal_scopes: Vec<AgentTerminalScopeV1>,
+}
+
+#[derive(Serialize)]
+struct ProviderCatalogV1<'a> {
+    version: u8,
+    owner: &'static str,
+    document_digest: String,
+    providers: Vec<ProviderCatalogEntryV1<'a>>,
+}
+
+#[derive(Serialize)]
+struct ProviderCatalogEntryV1<'a> {
+    provider_id: &'a str,
+    harness_profile_id: &'a str,
+    policy_digest: &'a str,
+    profile_document_digest: String,
+    transport: &'static str,
+    isolation: &'static str,
+    executable_available: bool,
+    argument_count: usize,
+    inherited_environment_name_count: usize,
+    authentication_method_configured: bool,
+}
+
+/// Returns a bounded, redacted projection after validating the complete owner
+/// document. Commands, arguments, paths, environment names, and credentials are
+/// deliberately absent.
+pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErrorV1> {
+    let bytes = fs::read(path).map_err(|_| ConfigErrorV1::Io)?;
+    let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ConfigErrorV1::Json)?;
+    let validated = validate(raw)?;
+    let providers = validated
+        .raw
+        .providers
+        .iter()
+        .zip(validated.profiles.iter())
+        .map(|(provider, profile)| ProviderCatalogEntryV1 {
+            provider_id: &provider.provider_id,
+            harness_profile_id: &provider.harness_profile_id,
+            policy_digest: &provider.policy_digest,
+            profile_document_digest: digest_text(profile.document_digest.into_bytes()),
+            transport: match provider.transport {
+                TransportConfigV1::Acp => "acp",
+                TransportConfigV1::ClaudeStreamJson => "claude_stream_json",
+            },
+            isolation: match provider.isolation {
+                IsolationConfigV1::Direct => "direct",
+                IsolationConfigV1::MacosSeatbelt { .. } => "macos_seatbelt",
+            },
+            executable_available: true,
+            argument_count: provider.arguments.len(),
+            inherited_environment_name_count: provider.inherited_environment_names.len(),
+            authentication_method_configured: provider.acp_agent_authentication_method.is_some(),
+        })
+        .collect();
+    serde_json::to_string(&ProviderCatalogV1 {
+        version: 1,
+        owner: "daimon-local-agent",
+        document_digest: digest_text(Sha256::digest(&bytes).into()),
+        providers,
+    })
+    .map_err(|_| ConfigErrorV1::Json)
+}
+
+fn digest_text(bytes: [u8; 32]) -> String {
+    let mut text = String::with_capacity(71);
+    text.push_str("sha256:");
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 #[derive(Clone)]

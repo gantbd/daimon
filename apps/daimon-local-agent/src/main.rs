@@ -1,6 +1,7 @@
 use std::{env, io, process::ExitCode};
 
-const USAGE: &str = "usage: daimon-local-agent [--check | --supervised] CONFIG.json";
+const USAGE: &str =
+    "usage: daimon-local-agent [--check | --describe-providers | --supervised] CONFIG.json";
 
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
@@ -8,18 +9,36 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let (check, supervised, path) = if first == "--check" || first == "--supervised" {
-        let Some(path) = arguments.next() else {
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
+    let (check, describe, supervised, path) =
+        if first == "--check" || first == "--describe-providers" || first == "--supervised" {
+            let Some(path) = arguments.next() else {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            };
+            (
+                first == "--check",
+                first == "--describe-providers",
+                first == "--supervised",
+                path,
+            )
+        } else {
+            (false, false, false, first)
         };
-        (first == "--check", first == "--supervised", path)
-    } else {
-        (false, false, first)
-    };
     if arguments.next().is_some() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
+    }
+    if describe {
+        return match daimon_local_agent::provider_catalog_json(path) {
+            Ok(catalog) => {
+                println!("{catalog}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let config = match daimon_local_agent::load(path) {
         Ok(config) => config,

@@ -21,7 +21,7 @@ use daimon_openai_local::{
 };
 use daimon_protocol as protocol;
 use daimon_service::{ServiceLimitsV1, model::ModelService};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -194,6 +194,79 @@ pub struct ValidatedConfigV1 {
     bindings: Vec<TaskBindingV1>,
     tools: Vec<[u8; 16]>,
     context: RuntimeContext,
+}
+
+#[derive(Serialize)]
+struct ProviderCatalogV1<'a> {
+    version: u8,
+    owner: &'static str,
+    document_digest: String,
+    providers: [ProviderCatalogEntryV1<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct ProviderCatalogEntryV1<'a> {
+    provider_id: &'a str,
+    harness_profile_id: &'a str,
+    profile_document_digest: String,
+    wire: &'static str,
+    model: &'a str,
+    endpoint_scope: &'static str,
+    endpoint_port: u16,
+    structured_output: bool,
+    structured_tools: bool,
+    sampling_temperature_milli: u16,
+    bearer_token_configured: bool,
+}
+
+/// Returns a bounded, redacted projection after validating the complete owner
+/// document. Host headers, paths, credential names, and credentials are absent.
+pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErrorV1> {
+    let bytes = fs::read(path).map_err(|_| ConfigErrorV1::Io)?;
+    let raw: ConfigV1 = serde_json::from_slice(&bytes).map_err(|_| ConfigErrorV1::Json)?;
+    let validated = validate(raw)?;
+    let address = validated.profile.endpoint.address;
+    let endpoint_scope = if address.ip().is_loopback() {
+        "loopback"
+    } else if match address.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private(),
+        std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+    } {
+        "private_network"
+    } else {
+        "public_network"
+    };
+    serde_json::to_string(&ProviderCatalogV1 {
+        version: 1,
+        owner: "daimon-local-model",
+        document_digest: digest_text(Sha256::digest(&bytes).into()),
+        providers: [ProviderCatalogEntryV1 {
+            provider_id: &validated.raw.provider.provider_id,
+            harness_profile_id: &validated.raw.provider.harness_profile_id,
+            profile_document_digest: digest_text(
+                validated.profile.snapshot.document_digest.into_bytes(),
+            ),
+            wire: "openai_chat_completions",
+            model: &validated.raw.provider.model,
+            endpoint_scope,
+            endpoint_port: address.port(),
+            structured_output: validated.raw.provider.structured_output,
+            structured_tools: validated.raw.provider.structured_tools,
+            sampling_temperature_milli: validated.raw.provider.sampling_temperature_milli,
+            bearer_token_configured: validated.raw.provider.bearer_token_env.is_some(),
+        }],
+    })
+    .map_err(|_| ConfigErrorV1::Json)
+}
+
+fn digest_text(bytes: [u8; 32]) -> String {
+    let mut text = String::with_capacity(71);
+    text.push_str("sha256:");
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<ValidatedConfigV1, ConfigErrorV1> {
