@@ -170,6 +170,10 @@ pub struct AcpTerminalConfigV1 {
 #[serde(deny_unknown_fields)]
 pub struct AcpTerminalCommandConfigV1 {
     pub command: String,
+    /// Optional command-specific Daimon capability. When omitted, the
+    /// terminal-scope capability remains the compatibility default.
+    #[serde(default)]
+    pub capability: Option<String>,
     pub program: PathBuf,
     #[serde(default)]
     pub argument_prefix: Vec<String>,
@@ -776,7 +780,6 @@ struct AgentFileReadRootV1 {
 struct AgentTerminalScopeV1 {
     workspace: [u8; 16],
     workspace_path: PathBuf,
-    capability: protocol::ToolCapabilityIdV1,
     boundary_program: PathBuf,
     commands: BTreeMap<String, AgentTerminalCommandV1>,
     environment_names: BTreeSet<String>,
@@ -786,6 +789,7 @@ struct AgentTerminalScopeV1 {
 
 #[derive(Clone)]
 struct AgentTerminalCommandV1 {
+    capability: protocol::ToolCapabilityIdV1,
     program: PathBuf,
     argument_prefix: Vec<String>,
     allow_additional_arguments: bool,
@@ -980,12 +984,22 @@ fn validate_terminal_scopes(
             {
                 return Err(ConfigErrorV1::Invalid);
             }
+            let command_capability = command
+                .capability
+                .as_deref()
+                .map(hex_id)
+                .transpose()?
+                .unwrap_or(capability);
+            if !tools.contains(&command_capability) {
+                return Err(ConfigErrorV1::Invalid);
+            }
             let program = fs::canonicalize(&command.program).map_err(|_| ConfigErrorV1::Io)?;
             if !program.is_file()
                 || commands
                     .insert(
                         command.command.clone(),
                         AgentTerminalCommandV1 {
+                            capability: protocol::ToolCapabilityIdV1::new(command_capability),
                             program,
                             argument_prefix: command.argument_prefix.clone(),
                             allow_additional_arguments: command.allow_additional_arguments,
@@ -999,7 +1013,6 @@ fn validate_terminal_scopes(
         scopes.push(AgentTerminalScopeV1 {
             workspace: workspace_id,
             workspace_path,
-            capability: protocol::ToolCapabilityIdV1::new(capability),
             boundary_program,
             commands,
             environment_names: config.environment_names.iter().cloned().collect(),
@@ -1250,7 +1263,10 @@ impl<A: ExecutionAuthorizer, T: AttemptValidator> AgentClientTerminal
         self.scopes.get(&request.workspace).is_some_and(|scope| {
             profile.wire == AgentWireProfileV1::AgentClientProtocol
                 && request.execution.profile == profile.harness_profile
-                && request.execution.tools.contains(&scope.capability)
+                && scope
+                    .commands
+                    .values()
+                    .any(|command| request.execution.tools.contains(&command.capability))
         })
     }
 
@@ -1263,16 +1279,23 @@ impl<A: ExecutionAuthorizer, T: AttemptValidator> AgentClientTerminal
             .get(&request.workspace)
             .cloned()
             .ok_or(AgentTerminalRefusalV1::Denied)?;
-        if request.execution.principal.into_bytes() != self.service_session.principal
-            || !request.execution.tools.contains(&scope.capability)
-        {
+        if request.execution.principal.into_bytes() != self.service_session.principal {
+            return Err(AgentTerminalRefusalV1::Denied);
+        }
+        let command =
+            std::str::from_utf8(&request.command).map_err(|_| AgentTerminalRefusalV1::Invalid)?;
+        let approved = scope
+            .commands
+            .get(command)
+            .ok_or(AgentTerminalRefusalV1::Denied)?;
+        if !request.execution.tools.contains(&approved.capability) {
             return Err(AgentTerminalRefusalV1::Denied);
         }
         let authority = self
             .authorizer
             .authorize(&self.service_session, &request.execution, request.now)
             .map_err(|_| AgentTerminalRefusalV1::Denied)?;
-        if !authority.tools.contains(&scope.capability) {
+        if !authority.tools.contains(&approved.capability) {
             return Err(AgentTerminalRefusalV1::Denied);
         }
         self.attempts
@@ -1287,8 +1310,6 @@ impl<A: ExecutionAuthorizer, T: AttemptValidator> AgentClientTerminal
         {
             return Err(AgentTerminalRefusalV1::Capacity);
         }
-        let command =
-            std::str::from_utf8(&request.command).map_err(|_| AgentTerminalRefusalV1::Invalid)?;
         let arguments = request
             .arguments
             .iter()
@@ -1298,10 +1319,6 @@ impl<A: ExecutionAuthorizer, T: AttemptValidator> AgentClientTerminal
                     .map_err(|_| AgentTerminalRefusalV1::Invalid)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let approved = scope
-            .commands
-            .get(command)
-            .ok_or(AgentTerminalRefusalV1::Denied)?;
         if !terminal_arguments_allowed(approved, &arguments)
             || dangerous_terminal_flag(&approved.program, &arguments)
         {
@@ -2567,6 +2584,7 @@ mod tests {
             boundary_program: PathBuf::from("/bin/echo"),
             commands: vec![AcpTerminalCommandConfigV1 {
                 command: "echo".to_owned(),
+                capability: None,
                 program: PathBuf::from("/bin/echo"),
                 argument_prefix: vec!["approved".to_owned()],
                 allow_additional_arguments: false,
@@ -2583,6 +2601,16 @@ mod tests {
         let validated = validate(value.clone()).unwrap();
         assert_eq!(validated.terminal_scopes.len(), 1);
 
+        let command_capability = "75757575757575757575757575757575".to_owned();
+        value.workspaces[0].acp_terminal.as_mut().unwrap().commands[0].capability =
+            Some(command_capability.clone());
+        assert!(matches!(
+            validate(value.clone()),
+            Err(ConfigErrorV1::Invalid)
+        ));
+        value.tool_capabilities.push(command_capability);
+        assert!(validate(value.clone()).is_ok());
+
         value.workspaces[0]
             .acp_terminal
             .as_mut()
@@ -2590,6 +2618,7 @@ mod tests {
             .commands
             .push(AcpTerminalCommandConfigV1 {
                 command: "echo".to_owned(),
+                capability: None,
                 program: PathBuf::from("/bin/echo"),
                 argument_prefix: Vec::new(),
                 allow_additional_arguments: true,
@@ -2600,6 +2629,7 @@ mod tests {
     #[test]
     fn exact_terminal_catalog_entry_refuses_model_supplied_suffixes() {
         let exact = AgentTerminalCommandV1 {
+            capability: protocol::ToolCapabilityIdV1::new([74; 16]),
             program: PathBuf::from("/bin/echo"),
             argument_prefix: vec!["test".to_owned(), "--package".to_owned(), "core".to_owned()],
             allow_additional_arguments: false,
@@ -2648,6 +2678,7 @@ mod tests {
         commands.insert(
             "sh".to_owned(),
             AgentTerminalCommandV1 {
+                capability: protocol::ToolCapabilityIdV1::new([75; 16]),
                 program,
                 argument_prefix: Vec::new(),
                 allow_additional_arguments: true,
@@ -2667,7 +2698,6 @@ mod tests {
             vec![AgentTerminalScopeV1 {
                 workspace: [6; 16],
                 workspace_path: workspace.clone(),
-                capability,
                 boundary_program: PathBuf::from("/bin/echo"),
                 commands,
                 environment_names: BTreeSet::new(),
@@ -2688,6 +2718,19 @@ mod tests {
             cwd: workspace.to_str().unwrap().as_bytes().to_vec(),
             output_byte_limit: Some(64),
         };
+        assert_eq!(
+            terminal.create_agent_terminal(&request),
+            Err(AgentTerminalRefusalV1::Denied)
+        );
+        assert_eq!(authority_calls.get(), 0);
+        terminal
+            .scopes
+            .get_mut(&[6; 16])
+            .unwrap()
+            .commands
+            .get_mut("sh")
+            .unwrap()
+            .capability = capability;
         assert_eq!(
             terminal.create_agent_terminal(&request),
             Err(AgentTerminalRefusalV1::Denied)

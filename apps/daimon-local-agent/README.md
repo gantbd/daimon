@@ -83,6 +83,7 @@ governed scope:
   "boundary_program": "/absolute/path/to/daimon-process-boundary",
   "commands": [{
     "command": "core-unit-tests",
+    "capability": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
     "program": "/absolute/path/to/cargo",
     "argument_prefix": ["test", "--package", "core", "--locked", "--offline"],
     "allow_additional_arguments": false
@@ -93,8 +94,13 @@ governed scope:
 }
 ```
 
-The capability must be part of the application-issued grant. A governed test
-catalog uses an operator-facing command name and sets
+The scope capability is a compatibility default. A command-specific
+`capability` overrides it, must independently appear in `tool_capabilities`,
+and is rechecked against both the exact turn execution and the live Aegis grant
+before that command can start. This allows a single workspace terminal catalog
+to expose independently authorized Pantheon and bounded-web gateways without
+granting either merely because the other is present. A governed test catalog
+uses an operator-facing command name and sets
 `allow_additional_arguments` to false, making the retained argument prefix the
 complete immutable argument vector. The model may select that entry but cannot
 append flags or widen its workspace/package scope. The field defaults true for
