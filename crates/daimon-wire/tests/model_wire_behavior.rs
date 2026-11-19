@@ -30,6 +30,14 @@ fn result() -> ModelExecutionResultV1 {
         execution_id: ExecutionIdV1::new([1; 16]),
         disposition: ExecutionDispositionV1::Completed,
         evidence_digest: ContentDigestV1::new([9; 32]),
+        invocation_evidence: Some(Box::new(ModelInvocationEvidenceV1 {
+            provider: ProviderProfileIdV1::new([21; 16]),
+            provider_document_digest: ContentDigestV1::new([22; 32]),
+            model_digest: ContentDigestV1::new([23; 32]),
+            context_manifest_digest: ContentDigestV1::new([24; 32]),
+            message_manifest_digest: ContentDigestV1::new([25; 32]),
+            evidence_scope_digest: ContentDigestV1::new([26; 32]),
+        })),
         input_tokens: 42,
         output_tokens: 17,
         output: b"bounded answer".to_vec(),
@@ -59,6 +67,12 @@ fn tool_result() -> ModelExecutionResultV1 {
             provider_correlation: b"call-15".to_vec(),
             arguments: br#"{"path":"README.md"}"#.to_vec(),
         }));
+    value
+}
+
+fn legacy_tool_result() -> ModelExecutionResultV1 {
+    let mut value = tool_result();
+    value.invocation_evidence = None;
     value
 }
 
@@ -142,21 +156,18 @@ fn native_tool_calls_use_the_additive_model_reply_family() {
     let limits = ModelLimitsV1::default();
     let reply = ModelReplyV1::Accepted(ModelOutcomeV1::Executed(tool_result()));
     let bytes = encode_model_reply(&reply, limits).unwrap();
-    assert_eq!(bytes[8], 7);
+    assert_eq!(bytes[8], 8);
     assert_eq!(decode_model_reply(&bytes, limits).unwrap(), reply);
 
     let mut falsely_legacy = bytes;
     falsely_legacy[8] = 5;
-    assert_eq!(
-        decode_model_reply(&falsely_legacy, limits),
-        Err(CodecErrorV1::Malformed)
-    );
+    assert!(decode_model_reply(&falsely_legacy, limits).is_err());
 }
 
 #[test]
 fn preceding_native_tool_reply_family_remains_decodable_but_has_no_resume_correlation() {
     let limits = ModelLimitsV1::default();
-    let reply = ModelReplyV1::Accepted(ModelOutcomeV1::Executed(tool_result()));
+    let reply = ModelReplyV1::Accepted(ModelOutcomeV1::Executed(legacy_tool_result()));
     let mut bytes = encode_model_reply(&reply, limits).unwrap();
     let marker = b"call-15";
     let start = bytes

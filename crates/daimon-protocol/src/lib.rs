@@ -3,6 +3,8 @@
 //! Session handles and correlation identifiers carry no authority. A service
 //! binds each session to separately authenticated host facts.
 
+use sha2::{Digest, Sha256};
+
 macro_rules! id {
     ($name:ident) => {
         #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -247,6 +249,125 @@ pub struct ModelInvocationV1 {
     pub estimated_input_tokens: u64,
 }
 
+/// Content-free identities derived from the exact invocation Daimon retained
+/// before provider dispatch. These values support correlation analysis; they
+/// do not establish reviewer independence or disclose prompt/context bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelInvocationEvidenceV1 {
+    pub provider: ProviderProfileIdV1,
+    pub provider_document_digest: ContentDigestV1,
+    pub model_digest: ContentDigestV1,
+    pub context_manifest_digest: ContentDigestV1,
+    pub message_manifest_digest: ContentDigestV1,
+    pub evidence_scope_digest: ContentDigestV1,
+}
+
+pub fn model_invocation_evidence(invocation: &ModelInvocationV1) -> ModelInvocationEvidenceV1 {
+    let model_digest = digest_manifest(b"DAIMON_MODEL_IDENTITY_V1\0", |hash| {
+        hash.update((invocation.provider.model.len() as u64).to_be_bytes());
+        hash.update(&invocation.provider.model);
+    });
+    let context_manifest_digest = digest_manifest(b"DAIMON_CONTEXT_MANIFEST_V1\0", |hash| {
+        hash.update((invocation.context.len() as u64).to_be_bytes());
+        for evidence in &invocation.context {
+            hash.update(evidence.reference.into_bytes());
+            hash.update([context_kind_tag(evidence.kind)]);
+            hash.update(evidence.source_digest.into_bytes());
+            hash.update(Sha256::digest(&evidence.bytes));
+            match evidence.grounding {
+                None => hash.update([0]),
+                Some(grounding) => {
+                    hash.update([1, grounding_depth_tag(grounding.depth)]);
+                    hash.update(grounding.grounding_digest.into_bytes());
+                    hash.update(grounding.surface_digest.into_bytes());
+                }
+            }
+        }
+    });
+    let message_manifest_digest = digest_manifest(b"DAIMON_MESSAGE_MANIFEST_V1\0", |hash| {
+        hash.update((invocation.messages.len() as u64).to_be_bytes());
+        for message in &invocation.messages {
+            hash.update([message_role_tag(message.role)]);
+            hash.update((message.content.len() as u64).to_be_bytes());
+            hash.update(Sha256::digest(&message.content));
+        }
+    });
+    let evidence_scope_digest = digest_manifest(b"DAIMON_EVIDENCE_SCOPE_V1\0", |hash| {
+        let mut entries = invocation
+            .context
+            .iter()
+            .map(|evidence| {
+                digest_manifest(b"DAIMON_EVIDENCE_SCOPE_ENTRY_V1\0", |entry| {
+                    entry.update([context_kind_tag(evidence.kind)]);
+                    entry.update(evidence.source_digest.into_bytes());
+                    if let Some(grounding) = evidence.grounding {
+                        entry.update([grounding_depth_tag(grounding.depth)]);
+                        entry.update(grounding.grounding_digest.into_bytes());
+                        entry.update(grounding.surface_digest.into_bytes());
+                    }
+                })
+                .into_bytes()
+            })
+            .collect::<Vec<_>>();
+        if let Some(continuation) = &invocation.continuation {
+            entries.extend(continuation.results.iter().map(|result| {
+                digest_manifest(b"DAIMON_TOOL_EVIDENCE_SCOPE_ENTRY_V1\0", |entry| {
+                    entry.update(result.capability.into_bytes());
+                    entry.update(result.evidence_digest.into_bytes());
+                    entry.update(result.output_digest.into_bytes());
+                })
+                .into_bytes()
+            }));
+        }
+        entries.sort_unstable();
+        hash.update((entries.len() as u64).to_be_bytes());
+        for entry in entries {
+            hash.update(entry);
+        }
+    });
+    ModelInvocationEvidenceV1 {
+        provider: invocation.provider.provider,
+        provider_document_digest: invocation.provider.document_digest,
+        model_digest,
+        context_manifest_digest,
+        message_manifest_digest,
+        evidence_scope_digest,
+    }
+}
+
+fn digest_manifest(domain: &[u8], update: impl FnOnce(&mut Sha256)) -> ContentDigestV1 {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    update(&mut hash);
+    ContentDigestV1::new(hash.finalize().into())
+}
+
+const fn context_kind_tag(value: ContextKindV1) -> u8 {
+    match value {
+        ContextKindV1::AgoraMessage => 0,
+        ContextKindV1::ChronosWork => 1,
+        ContextKindV1::VellumDocument => 2,
+        ContextKindV1::DendriteGrounding => 3,
+    }
+}
+
+const fn grounding_depth_tag(value: GroundingDepthV1) -> u8 {
+    match value {
+        GroundingDepthV1::Ambient => 0,
+        GroundingDepthV1::Activated => 1,
+        GroundingDepthV1::Reference => 2,
+    }
+}
+
+const fn message_role_tag(value: MessageRoleV1) -> u8 {
+    match value {
+        MessageRoleV1::System => 0,
+        MessageRoleV1::User => 1,
+        MessageRoleV1::Assistant => 2,
+        MessageRoleV1::Tool => 3,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgoraMessageProposalV1 {
     pub room: [u8; 16],
@@ -295,6 +416,9 @@ pub struct ModelExecutionResultV1 {
     pub execution_id: ExecutionIdV1,
     pub disposition: ExecutionDispositionV1,
     pub evidence_digest: ContentDigestV1,
+    /// `None` is reserved for legacy V1–V3 wire replies. Current services
+    /// always derive and publish this from their retained invocation.
+    pub invocation_evidence: Option<Box<ModelInvocationEvidenceV1>>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub output: Vec<u8>,
@@ -414,6 +538,92 @@ pub enum RefusalV1 {
     UnknownExecution,
     InvalidInput,
     Exhausted,
+}
+
+#[cfg(test)]
+mod invocation_evidence_tests {
+    use super::*;
+
+    fn invocation() -> ModelInvocationV1 {
+        ModelInvocationV1 {
+            execution_id: ExecutionIdV1::new([1; 16]),
+            provider: ProviderProfileSnapshotV1 {
+                provider: ProviderProfileIdV1::new([2; 16]),
+                harness_profile: HarnessProfileIdV1::new([3; 16]),
+                wire: ProviderWireProfileV1::OpenAiChatCompletions,
+                model: b"model-a".to_vec(),
+                structured_tools: true,
+                document_digest: ContentDigestV1::new([4; 32]),
+            },
+            context: vec![
+                ContextEvidenceV1 {
+                    reference: ContextReferenceIdV1::new([5; 16]),
+                    kind: ContextKindV1::ChronosWork,
+                    bytes: b"work".to_vec(),
+                    source_digest: ContentDigestV1::new([6; 32]),
+                    grounding: None,
+                },
+                ContextEvidenceV1 {
+                    reference: ContextReferenceIdV1::new([7; 16]),
+                    kind: ContextKindV1::DendriteGrounding,
+                    bytes: b"grounding".to_vec(),
+                    source_digest: ContentDigestV1::new([8; 32]),
+                    grounding: Some(GroundingEvidenceV1 {
+                        depth: GroundingDepthV1::Activated,
+                        grounding_digest: ContentDigestV1::new([9; 32]),
+                        surface_digest: ContentDigestV1::new([10; 32]),
+                    }),
+                },
+            ],
+            messages: vec![ModelMessageV1 {
+                role: MessageRoleV1::User,
+                content: b"review this".to_vec(),
+            }],
+            tools: vec![ToolCapabilityIdV1::new([11; 16])],
+            continuation: None,
+            estimated_input_tokens: 3,
+        }
+    }
+
+    #[test]
+    fn invocation_dimensions_are_stable_and_separately_sensitive() {
+        let original = invocation();
+        let evidence = model_invocation_evidence(&original);
+        assert_eq!(evidence, model_invocation_evidence(&original));
+
+        let mut changed_model = original.clone();
+        changed_model.provider.model = b"model-b".to_vec();
+        let changed_model = model_invocation_evidence(&changed_model);
+        assert_ne!(changed_model.model_digest, evidence.model_digest);
+        assert_eq!(
+            changed_model.message_manifest_digest,
+            evidence.message_manifest_digest
+        );
+
+        let mut reordered_context = original.clone();
+        reordered_context.context.reverse();
+        let reordered_context = model_invocation_evidence(&reordered_context);
+        assert_ne!(
+            reordered_context.context_manifest_digest,
+            evidence.context_manifest_digest
+        );
+        assert_eq!(
+            reordered_context.evidence_scope_digest,
+            evidence.evidence_scope_digest
+        );
+
+        let mut changed_message = original;
+        changed_message.messages[0].content = b"review that".to_vec();
+        let changed_message = model_invocation_evidence(&changed_message);
+        assert_ne!(
+            changed_message.message_manifest_digest,
+            evidence.message_manifest_digest
+        );
+        assert_eq!(
+            changed_message.evidence_scope_digest,
+            evidence.evidence_scope_digest
+        );
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

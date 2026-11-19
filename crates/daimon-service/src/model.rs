@@ -346,7 +346,9 @@ where
             &core_invocation,
             core_model_receipt(&receipt),
         ) {
-            Ok(result) => protocol_model_result(result),
+            Ok(result) => {
+                protocol_model_result(result, protocol::model_invocation_evidence(&invocation))
+            }
             Err(error) => return refused(core_refusal(error)),
         };
         if let Some(entry) = self.executions.get_mut(&request.execution_id) {
@@ -796,11 +798,15 @@ fn core_proposal(value: &protocol::OutputProposalV1) -> core::OutputProposalV1 {
     }
 }
 
-fn protocol_model_result(value: core::ModelHarnessResultV1) -> protocol::ModelExecutionResultV1 {
+fn protocol_model_result(
+    value: core::ModelHarnessResultV1,
+    invocation_evidence: protocol::ModelInvocationEvidenceV1,
+) -> protocol::ModelExecutionResultV1 {
     protocol::ModelExecutionResultV1 {
         execution_id: protocol::ExecutionIdV1::new(value.execution_id.into_bytes()),
         disposition: disposition_from_core(value.disposition),
         evidence_digest: protocol::ContentDigestV1::new(value.evidence_digest.into_bytes()),
+        invocation_evidence: Some(Box::new(invocation_evidence)),
         input_tokens: value.input_tokens,
         output_tokens: value.output_tokens,
         output: value.output,

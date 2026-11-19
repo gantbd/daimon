@@ -92,11 +92,13 @@ fn stored(id: u8, completed: bool) -> StoredModelExecutionV1 {
         }],
         estimated_input_tokens: 4,
     };
+    let invocation_evidence = protocol::model_invocation_evidence(&invocation);
     let state = if completed {
         StoredModelExecutionStateV1::Completed(protocol::ModelExecutionResultV1 {
             execution_id,
             disposition: protocol::ExecutionDispositionV1::Completed,
             evidence_digest: protocol::ContentDigestV1::new([35; 32]),
+            invocation_evidence: Some(Box::new(invocation_evidence)),
             input_tokens: 4,
             output_tokens: 5,
             output: b"answer".to_vec(),

@@ -370,7 +370,7 @@ fn encode_execution(
     match &execution.state {
         StoredModelExecutionStateV1::OutcomeUnknown => writer.byte(0),
         StoredModelExecutionStateV1::Completed(result) => {
-            validate_result(request, result, limits)?;
+            validate_result(request, invocation, result, limits)?;
             writer.byte(1)?;
             encode_result(writer, result, limits)
         }
@@ -397,8 +397,8 @@ fn decode_execution(
     let state = match reader.byte()? {
         0 => StoredModelExecutionStateV1::OutcomeUnknown,
         1 => {
-            let result = decode_result(reader, limits)?;
-            validate_result(&request, &result, limits)?;
+            let result = decode_result(reader, limits, &invocation)?;
+            validate_result(&request, &invocation, &result, limits)?;
             StoredModelExecutionStateV1::Completed(result)
         }
         _ => return Err(CodecErrorV1::Invalid),
@@ -678,6 +678,7 @@ fn encode_result(
 fn decode_result(
     reader: &mut Reader<'_>,
     limits: ModelStoreLimitsV1,
+    invocation: &protocol::ModelInvocationV1,
 ) -> Result<protocol::ModelExecutionResultV1, CodecErrorV1> {
     let execution_id = protocol::ExecutionIdV1::new(reader.id()?);
     let disposition = decode_disposition(reader.byte()?)?;
@@ -716,6 +717,7 @@ fn decode_result(
         execution_id,
         disposition,
         evidence_digest,
+        invocation_evidence: Some(Box::new(protocol::model_invocation_evidence(invocation))),
         input_tokens,
         output_tokens,
         output,
@@ -783,6 +785,7 @@ fn validate_context_shape(
 
 fn validate_result(
     request: &protocol::ExecuteRequestV1,
+    invocation: &protocol::ModelInvocationV1,
     result: &protocol::ModelExecutionResultV1,
     limits: ModelStoreLimitsV1,
 ) -> Result<(), CodecErrorV1> {
@@ -799,6 +802,8 @@ fn validate_result(
         })
         .ok_or(CodecErrorV1::Limit)?;
     if result.execution_id != request.execution_id
+        || result.invocation_evidence.as_deref()
+            != Some(&protocol::model_invocation_evidence(invocation))
         || result.input_tokens > request.budget.max_input_tokens
         || result.output_tokens > request.budget.max_output_tokens
         || result.output.len() > limits.max_output_bytes

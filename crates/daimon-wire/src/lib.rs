@@ -14,6 +14,7 @@ const MODEL_REQUEST: u8 = 4;
 const MODEL_REPLY: u8 = 5;
 const MODEL_REPLY_V2: u8 = 6;
 const MODEL_REPLY_V3: u8 = 7;
+const MODEL_REPLY_V4: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LimitsV1 {
@@ -428,8 +429,11 @@ pub fn encode_model_reply(
     limits: ModelLimitsV1,
 ) -> Result<Vec<u8>, CodecErrorV1> {
     validate_model_limits(limits)?;
-    let native_tools = reply_has_tool_calls(reply);
-    let kind = if native_tools {
+    let invocation_evidence = reply_has_invocation_evidence(reply);
+    let native_tools = reply_has_tool_calls(reply) || invocation_evidence;
+    let kind = if invocation_evidence {
+        MODEL_REPLY_V4
+    } else if native_tools {
         MODEL_REPLY_V3
     } else {
         MODEL_REPLY
@@ -438,7 +442,13 @@ pub fn encode_model_reply(
     match reply {
         ModelReplyV1::Accepted(outcome) => {
             writer.byte(0)?;
-            encode_model_outcome(&mut writer, outcome, limits, native_tools)?;
+            encode_model_outcome(
+                &mut writer,
+                outcome,
+                limits,
+                native_tools,
+                invocation_evidence,
+            )?;
         }
         ModelReplyV1::Refused(refusal) => {
             writer.byte(1)?;
@@ -453,16 +463,19 @@ pub fn decode_model_reply(
     limits: ModelLimitsV1,
 ) -> Result<ModelReplyV1, CodecErrorV1> {
     validate_model_limits(limits)?;
-    let (native_tools, provider_correlation) = match bytes.get(8).copied() {
-        Some(MODEL_REPLY) => (false, false),
-        Some(MODEL_REPLY_V2) => (true, false),
-        Some(MODEL_REPLY_V3) => (true, true),
+    let (native_tools, provider_correlation, invocation_evidence) = match bytes.get(8).copied() {
+        Some(MODEL_REPLY) => (false, false, false),
+        Some(MODEL_REPLY_V2) => (true, false, false),
+        Some(MODEL_REPLY_V3) => (true, true, false),
+        Some(MODEL_REPLY_V4) => (true, true, true),
         _ => return Err(CodecErrorV1::Malformed),
     };
     let mut reader = Reader::new(
         bytes,
         legacy_limits(limits),
-        if provider_correlation {
+        if invocation_evidence {
+            MODEL_REPLY_V4
+        } else if provider_correlation {
             MODEL_REPLY_V3
         } else if native_tools {
             MODEL_REPLY_V2
@@ -476,12 +489,15 @@ pub fn decode_model_reply(
             limits,
             native_tools,
             provider_correlation,
+            invocation_evidence,
         )?),
         1 => ModelReplyV1::Refused(decode_refusal(reader.byte()?)?),
         _ => return Err(CodecErrorV1::Malformed),
     };
     reader.finish()?;
-    if native_tools != reply_has_tool_calls(&reply) {
+    if (!invocation_evidence && native_tools != reply_has_tool_calls(&reply))
+        || invocation_evidence != reply_has_invocation_evidence(&reply)
+    {
         return Err(CodecErrorV1::Malformed);
     }
     Ok(reply)
@@ -664,6 +680,7 @@ fn encode_model_outcome(
     outcome: &ModelOutcomeV1,
     limits: ModelLimitsV1,
     native_tools: bool,
+    invocation_evidence: bool,
 ) -> Result<(), CodecErrorV1> {
     match outcome {
         ModelOutcomeV1::Executed(result) => {
@@ -674,6 +691,18 @@ fn encode_model_outcome(
             writer.id(result.execution_id.into_bytes())?;
             writer.byte(disposition_tag(result.disposition))?;
             writer.digest(result.evidence_digest.into_bytes())?;
+            if invocation_evidence {
+                let evidence = result
+                    .invocation_evidence
+                    .as_deref()
+                    .ok_or(CodecErrorV1::Malformed)?;
+                writer.id(evidence.provider.into_bytes())?;
+                writer.digest(evidence.provider_document_digest.into_bytes())?;
+                writer.digest(evidence.model_digest.into_bytes())?;
+                writer.digest(evidence.context_manifest_digest.into_bytes())?;
+                writer.digest(evidence.message_manifest_digest.into_bytes())?;
+                writer.digest(evidence.evidence_scope_digest.into_bytes())?;
+            }
             writer.u64(result.input_tokens)?;
             writer.u64(result.output_tokens)?;
             writer.bytes(&result.output, limits.max_output_bytes)?;
@@ -730,12 +759,25 @@ fn decode_model_outcome(
     limits: ModelLimitsV1,
     native_tools: bool,
     provider_correlation: bool,
+    invocation_evidence: bool,
 ) -> Result<ModelOutcomeV1, CodecErrorV1> {
     Ok(match reader.byte()? {
         1 => {
             let execution_id = ExecutionIdV1::new(reader.id()?);
             let disposition = decode_disposition(reader.byte()?)?;
             let evidence_digest = ContentDigestV1::new(reader.digest()?);
+            let invocation_evidence = invocation_evidence
+                .then(|| {
+                    Ok::<_, CodecErrorV1>(Box::new(ModelInvocationEvidenceV1 {
+                        provider: ProviderProfileIdV1::new(reader.id()?),
+                        provider_document_digest: ContentDigestV1::new(reader.digest()?),
+                        model_digest: ContentDigestV1::new(reader.digest()?),
+                        context_manifest_digest: ContentDigestV1::new(reader.digest()?),
+                        message_manifest_digest: ContentDigestV1::new(reader.digest()?),
+                        evidence_scope_digest: ContentDigestV1::new(reader.digest()?),
+                    }))
+                })
+                .transpose()?;
             let input_tokens = reader.u64()?;
             let output_tokens = reader.u64()?;
             let output = reader.bytes(limits.max_output_bytes)?;
@@ -779,6 +821,7 @@ fn decode_model_outcome(
                 execution_id,
                 disposition,
                 evidence_digest,
+                invocation_evidence,
                 input_tokens,
                 output_tokens,
                 output,
@@ -805,6 +848,14 @@ fn reply_has_tool_calls(reply: &ModelReplyV1) -> bool {
         reply,
         ModelReplyV1::Accepted(ModelOutcomeV1::Executed(result))
             if result.proposals.iter().any(|proposal| matches!(proposal, OutputProposalV1::ToolCall(_)))
+    )
+}
+
+fn reply_has_invocation_evidence(reply: &ModelReplyV1) -> bool {
+    matches!(
+        reply,
+        ModelReplyV1::Accepted(ModelOutcomeV1::Executed(result))
+            if result.invocation_evidence.is_some()
     )
 }
 

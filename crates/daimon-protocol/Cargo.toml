@@ -7,6 +7,9 @@ description = "Transport-neutral native Daimon service contract"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[dependencies]
+sha2 = "0.10"
+
 [lints.rust]
 unsafe_code = "forbid"
 
