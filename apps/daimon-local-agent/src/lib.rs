@@ -173,6 +173,15 @@ pub struct AcpTerminalCommandConfigV1 {
     pub program: PathBuf,
     #[serde(default)]
     pub argument_prefix: Vec<String>,
+    /// Whether a provider may append arguments after the approved prefix.
+    /// Existing interactive command profiles retain prefix behavior; governed
+    /// test-catalog entries set this false so selection cannot widen scope.
+    #[serde(default = "default_allow_additional_arguments")]
+    pub allow_additional_arguments: bool,
+}
+
+const fn default_allow_additional_arguments() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -779,6 +788,7 @@ struct AgentTerminalScopeV1 {
 struct AgentTerminalCommandV1 {
     program: PathBuf,
     argument_prefix: Vec<String>,
+    allow_additional_arguments: bool,
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<ValidatedConfigV1, ConfigErrorV1> {
@@ -978,6 +988,7 @@ fn validate_terminal_scopes(
                         AgentTerminalCommandV1 {
                             program,
                             argument_prefix: command.argument_prefix.clone(),
+                            allow_additional_arguments: command.allow_additional_arguments,
                         },
                     )
                     .is_some()
@@ -1291,7 +1302,7 @@ impl<A: ExecutionAuthorizer, T: AttemptValidator> AgentClientTerminal
             .commands
             .get(command)
             .ok_or(AgentTerminalRefusalV1::Denied)?;
-        if !arguments.starts_with(&approved.argument_prefix)
+        if !terminal_arguments_allowed(approved, &arguments)
             || dangerous_terminal_flag(&approved.program, &arguments)
         {
             return Err(AgentTerminalRefusalV1::Denied);
@@ -1504,6 +1515,12 @@ fn dangerous_terminal_flag(program: &Path, arguments: &[String]) -> bool {
                 || (flag.len() == 2 && argument.starts_with(flag))
         })
     })
+}
+
+fn terminal_arguments_allowed(approved: &AgentTerminalCommandV1, arguments: &[String]) -> bool {
+    arguments.starts_with(&approved.argument_prefix)
+        && (approved.allow_additional_arguments
+            || arguments.len() == approved.argument_prefix.len())
 }
 
 pub fn run(config: ValidatedConfigV1) -> Result<(), Box<dyn std::error::Error>> {
@@ -2552,6 +2569,7 @@ mod tests {
                 command: "echo".to_owned(),
                 program: PathBuf::from("/bin/echo"),
                 argument_prefix: vec!["approved".to_owned()],
+                allow_additional_arguments: false,
             }],
             environment_names: vec!["MODE".to_owned()],
             max_handles: 2,
@@ -2574,8 +2592,47 @@ mod tests {
                 command: "echo".to_owned(),
                 program: PathBuf::from("/bin/echo"),
                 argument_prefix: Vec::new(),
+                allow_additional_arguments: true,
             });
         assert!(matches!(validate(value), Err(ConfigErrorV1::Invalid)));
+    }
+
+    #[test]
+    fn exact_terminal_catalog_entry_refuses_model_supplied_suffixes() {
+        let exact = AgentTerminalCommandV1 {
+            program: PathBuf::from("/bin/echo"),
+            argument_prefix: vec!["test".to_owned(), "--package".to_owned(), "core".to_owned()],
+            allow_additional_arguments: false,
+        };
+        assert!(terminal_arguments_allowed(
+            &exact,
+            &["test".to_owned(), "--package".to_owned(), "core".to_owned()]
+        ));
+        assert!(!terminal_arguments_allowed(
+            &exact,
+            &[
+                "test".to_owned(),
+                "--package".to_owned(),
+                "core".to_owned(),
+                "--manifest-path".to_owned(),
+                "/outside/Cargo.toml".to_owned(),
+            ]
+        ));
+
+        let prefix = AgentTerminalCommandV1 {
+            allow_additional_arguments: true,
+            ..exact
+        };
+        assert!(terminal_arguments_allowed(
+            &prefix,
+            &[
+                "test".to_owned(),
+                "--package".to_owned(),
+                "core".to_owned(),
+                "--exact".to_owned(),
+                "one_test".to_owned(),
+            ]
+        ));
     }
 
     #[test]
@@ -2593,6 +2650,7 @@ mod tests {
             AgentTerminalCommandV1 {
                 program,
                 argument_prefix: Vec::new(),
+                allow_additional_arguments: true,
             },
         );
         let mut terminal = GovernedAgentTerminal::new(

@@ -82,9 +82,10 @@ governed scope:
   "capability": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
   "boundary_program": "/absolute/path/to/daimon-process-boundary",
   "commands": [{
-    "command": "cargo",
+    "command": "core-unit-tests",
     "program": "/absolute/path/to/cargo",
-    "argument_prefix": ["test"]
+    "argument_prefix": ["test", "--package", "core", "--locked", "--offline"],
+    "allow_additional_arguments": false
   }],
   "environment_names": ["RUST_BACKTRACE"],
   "max_handles": 2,
@@ -92,7 +93,13 @@ governed scope:
 }
 ```
 
-The capability must be part of the application-issued grant. `--check`
+The capability must be part of the application-issued grant. A governed test
+catalog uses an operator-facing command name and sets
+`allow_additional_arguments` to false, making the retained argument prefix the
+complete immutable argument vector. The model may select that entry but cannot
+append flags or widen its workspace/package scope. The field defaults true for
+existing interactive terminal profiles whose reviewed policy deliberately
+allows a bounded suffix. `--check`
 canonicalizes the workspace, boundary, and target executables and rejects
 aliases, duplicate command/environment names, invalid limits, and relative or
 missing programs. At create time the governor rechecks current Aegis authority
