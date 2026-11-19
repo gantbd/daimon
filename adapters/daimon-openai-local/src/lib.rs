@@ -6,7 +6,8 @@
 #![forbid(unsafe_code)]
 
 use daimon_host::{
-    AuthenticatedSessionV1, ModelProvider, ModelProviderOutcomeV1, ProfileRefusalV1,
+    AuthenticatedSessionV1, ModelProvider, ModelProviderDiagnosticKindV1,
+    ModelProviderDiagnosticReceiptV1, ModelProviderOutcomeV1, ProfileRefusalV1,
     ProviderProfileResolver,
 };
 use daimon_protocol as protocol;
@@ -130,6 +131,7 @@ impl ProviderProfileResolver for StaticProfileResolver {
 
 pub struct OpenAiCompatibleProvider {
     endpoints: BTreeMap<protocol::ProviderProfileIdV1, EndpointV1>,
+    diagnostic: Option<ModelProviderDiagnosticReceiptV1>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -146,7 +148,10 @@ impl OpenAiCompatibleProvider {
                 return None;
             }
         }
-        Some(Self { endpoints })
+        Some(Self {
+            endpoints,
+            diagnostic: None,
+        })
     }
 }
 
@@ -218,13 +223,29 @@ impl ModelProvider for OpenAiCompatibleProvider {
         &mut self,
         invocation: &protocol::ModelInvocationV1,
     ) -> ModelProviderOutcomeV1 {
+        self.diagnostic = None;
         let Some(endpoint) = self.endpoints.get(&invocation.provider.provider) else {
+            self.diagnostic = Some(diagnostic(
+                invocation,
+                ModelProviderDiagnosticKindV1::UnknownProfile,
+            ));
             return ModelProviderOutcomeV1::OutcomeUnknown;
         };
         match execute_once(endpoint, invocation) {
             Ok(receipt) => ModelProviderOutcomeV1::Receipt(receipt),
-            Err(()) => ModelProviderOutcomeV1::OutcomeUnknown,
+            Err(receipt) => {
+                self.diagnostic = Some(receipt);
+                ModelProviderOutcomeV1::OutcomeUnknown
+            }
         }
+    }
+
+    fn diagnostic_receipt(
+        &self,
+        execution_id: protocol::ExecutionIdV1,
+    ) -> Option<ModelProviderDiagnosticReceiptV1> {
+        self.diagnostic
+            .filter(|receipt| receipt.execution_id == execution_id)
     }
 }
 
@@ -356,11 +377,41 @@ enum Proposal {
     },
 }
 
+fn diagnostic(
+    invocation: &protocol::ModelInvocationV1,
+    kind: ModelProviderDiagnosticKindV1,
+) -> ModelProviderDiagnosticReceiptV1 {
+    ModelProviderDiagnosticReceiptV1 {
+        execution_id: invocation.execution_id,
+        provider_document_digest: invocation.provider.document_digest,
+        kind,
+        response_digest: None,
+    }
+}
+
+fn response_diagnostic(
+    invocation: &protocol::ModelInvocationV1,
+    kind: ModelProviderDiagnosticKindV1,
+    response: &[u8],
+) -> ModelProviderDiagnosticReceiptV1 {
+    let mut receipt = diagnostic(invocation, kind);
+    receipt.response_digest = Some(protocol::ContentDigestV1::new(
+        Sha256::digest(response).into(),
+    ));
+    receipt
+}
+
 fn execute_once(
     endpoint: &EndpointV1,
     invocation: &protocol::ModelInvocationV1,
-) -> Result<protocol::ModelProviderReceiptV1, ()> {
-    let model = std::str::from_utf8(&invocation.provider.model).map_err(|_| ())?;
+) -> Result<protocol::ModelProviderReceiptV1, ModelProviderDiagnosticReceiptV1> {
+    let request_failure = || {
+        diagnostic(
+            invocation,
+            ModelProviderDiagnosticKindV1::RequestConstruction,
+        )
+    };
+    let model = std::str::from_utf8(&invocation.provider.model).map_err(|_| request_failure())?;
     let mut messages = invocation
         .messages
         .iter()
@@ -374,28 +425,28 @@ fn execute_once(
                 },
                 content: Some(
                     std::str::from_utf8(&message.content)
-                        .map_err(|_| ())?
+                        .map_err(|_| request_failure())?
                         .to_owned(),
                 ),
                 tool_calls: None,
                 tool_call_id: None,
             })
         })
-        .collect::<Result<Vec<_>, ()>>()?;
+        .collect::<Result<Vec<_>, ModelProviderDiagnosticReceiptV1>>()?;
     if let Some(continuation) = &invocation.continuation {
         if continuation.results.is_empty() {
-            return Err(());
+            return Err(request_failure());
         }
         let mut calls = Vec::new();
         calls
             .try_reserve(continuation.results.len())
-            .map_err(|_| ())?;
+            .map_err(|_| request_failure())?;
         for result in &continuation.results {
             let id = std::str::from_utf8(&result.provider_correlation)
-                .map_err(|_| ())?
+                .map_err(|_| request_failure())?
                 .to_owned();
             let arguments = std::str::from_utf8(&result.arguments)
-                .map_err(|_| ())?
+                .map_err(|_| request_failure())?
                 .to_owned();
             calls.push(RequestToolCall {
                 id,
@@ -413,7 +464,7 @@ fn execute_once(
             } else {
                 Some(
                     std::str::from_utf8(&continuation.source_output)
-                        .map_err(|_| ())?
+                        .map_err(|_| request_failure())?
                         .to_owned(),
                 )
             },
@@ -423,11 +474,11 @@ fn execute_once(
         for result in &continuation.results {
             messages.push(ChatMessage {
                 role: "tool",
-                content: Some(tool_output_content(&result.output)?),
+                content: Some(tool_output_content(&result.output).map_err(|_| request_failure())?),
                 tool_calls: None,
                 tool_call_id: Some(
                     std::str::from_utf8(&result.provider_correlation)
-                        .map_err(|_| ())?
+                        .map_err(|_| request_failure())?
                         .to_owned(),
                 ),
             });
@@ -461,50 +512,67 @@ fn execute_once(
         response_format,
         tools,
     })
-    .map_err(|_| ())?;
+    .map_err(|_| request_failure())?;
     if body.len() > endpoint.max_request_bytes {
-        return Err(());
+        return Err(request_failure());
     }
-    let response = post_once(endpoint, &body)?;
-    let decoded: ChatResponse = serde_json::from_slice(&response).map_err(|_| ())?;
-    let usage = decoded.usage.ok_or(())?;
-    let choice = decoded.choices.into_iter().next().ok_or(())?;
+    let response = post_once(endpoint, &body, invocation)?;
+    let response_failure = |kind| response_diagnostic(invocation, kind, &response);
+    let decoded: ChatResponse = serde_json::from_slice(&response)
+        .map_err(|_| response_failure(ModelProviderDiagnosticKindV1::InvalidJson))?;
+    let usage = decoded
+        .usage
+        .ok_or_else(|| response_failure(ModelProviderDiagnosticKindV1::MissingUsage))?;
+    let choice = decoded
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| response_failure(ModelProviderDiagnosticKindV1::MissingChoice))?;
     let content = choice.message.content.unwrap_or_default();
     if content.is_empty() && choice.message.tool_calls.is_empty() {
-        return Err(());
+        return Err(response_failure(
+            ModelProviderDiagnosticKindV1::EmptyResponse,
+        ));
     }
     let has_tool_calls = !choice.message.tool_calls.is_empty();
     let (output, mut proposals) = match endpoint.response_mode {
         _ if has_tool_calls && content.is_empty() => (Vec::new(), Vec::new()),
         ResponseModeV1::PlainText => (content.into_bytes(), Vec::new()),
         ResponseModeV1::DaimonJsonSchema => {
-            let envelope: Envelope = serde_json::from_str(&content).map_err(|_| ())?;
+            let envelope: Envelope = serde_json::from_str(&content).map_err(|_| {
+                response_failure(ModelProviderDiagnosticKindV1::InvalidStructuredOutput)
+            })?;
             let proposals = envelope
                 .proposals
                 .into_iter()
                 .map(protocol_proposal)
-                .collect::<Result<Vec<_>, ()>>()?;
+                .collect::<Result<Vec<_>, ()>>()
+                .map_err(|_| {
+                    response_failure(ModelProviderDiagnosticKindV1::InvalidStructuredOutput)
+                })?;
             (envelope.output.into_bytes(), proposals)
         }
     };
     if has_tool_calls {
+        let invalid_tool_call = || response_failure(ModelProviderDiagnosticKindV1::InvalidToolCall);
         if !invocation.provider.structured_tools || invocation.tools.is_empty() {
-            return Err(());
+            return Err(invalid_tool_call());
         }
         for call in choice.message.tool_calls {
             if call.r#type != "function" || call.id.is_empty() || call.id.len() > 1_024 {
-                return Err(());
+                return Err(invalid_tool_call());
             }
-            let capability = decode_tool_name(&call.function.name)?;
+            let capability =
+                decode_tool_name(&call.function.name).map_err(|_| invalid_tool_call())?;
             if !invocation.tools.contains(&capability) {
-                return Err(());
+                return Err(invalid_tool_call());
             }
             let arguments: serde_json::Value =
-                serde_json::from_str(&call.function.arguments).map_err(|_| ())?;
+                serde_json::from_str(&call.function.arguments).map_err(|_| invalid_tool_call())?;
             if !arguments.is_object() {
-                return Err(());
+                return Err(invalid_tool_call());
             }
-            let arguments = serde_json::to_vec(&arguments).map_err(|_| ())?;
+            let arguments = serde_json::to_vec(&arguments).map_err(|_| invalid_tool_call())?;
             let mut hash = Sha256::new();
             hash.update(b"daimon-tool-call-v1\0");
             hash.update(invocation.execution_id.into_bytes());
@@ -750,13 +818,17 @@ pub fn evidence_digest(invocation: &protocol::ModelInvocationV1) -> protocol::Co
     protocol::ContentDigestV1::new(hash.finalize().into())
 }
 
-fn post_once(endpoint: &EndpointV1, body: &[u8]) -> Result<Vec<u8>, ()> {
-    let mut stream =
-        TcpStream::connect_timeout(&endpoint.address, endpoint.connect_timeout).map_err(|_| ())?;
+fn post_once(
+    endpoint: &EndpointV1,
+    body: &[u8],
+    invocation: &protocol::ModelInvocationV1,
+) -> Result<Vec<u8>, ModelProviderDiagnosticReceiptV1> {
+    let mut stream = TcpStream::connect_timeout(&endpoint.address, endpoint.connect_timeout)
+        .map_err(|_| diagnostic(invocation, ModelProviderDiagnosticKindV1::Connect))?;
     stream
         .set_read_timeout(Some(endpoint.io_timeout))
         .and_then(|()| stream.set_write_timeout(Some(endpoint.io_timeout)))
-        .map_err(|_| ())?;
+        .map_err(|_| diagnostic(invocation, ModelProviderDiagnosticKindV1::Transport))?;
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n",
         endpoint.path,
@@ -775,75 +847,105 @@ fn post_once(endpoint: &EndpointV1, body: &[u8]) -> Result<Vec<u8>, ()> {
         .checked_add(body.len())
         .is_none_or(|length| length > endpoint.max_request_bytes)
     {
-        return Err(());
+        return Err(diagnostic(
+            invocation,
+            ModelProviderDiagnosticKindV1::RequestConstruction,
+        ));
     }
-    stream.write_all(&head).map_err(|_| ())?;
-    stream.write_all(body).map_err(|_| ())?;
-    stream.flush().map_err(|_| ())?;
+    stream
+        .write_all(&head)
+        .and_then(|()| stream.write_all(body))
+        .and_then(|()| stream.flush())
+        .map_err(|_| diagnostic(invocation, ModelProviderDiagnosticKindV1::Transport))?;
 
     let maximum = u64::try_from(endpoint.max_response_bytes)
-        .map_err(|_| ())?
+        .map_err(|_| diagnostic(invocation, ModelProviderDiagnosticKindV1::ResponseTooLarge))?
         .checked_add(1)
-        .ok_or(())?;
+        .ok_or_else(|| diagnostic(invocation, ModelProviderDiagnosticKindV1::ResponseTooLarge))?;
     let mut response = Vec::new();
     stream
         .take(maximum)
         .read_to_end(&mut response)
-        .map_err(|_| ())?;
+        .map_err(|_| diagnostic(invocation, ModelProviderDiagnosticKindV1::Transport))?;
     if response.len() > endpoint.max_response_bytes {
-        return Err(());
+        return Err(response_diagnostic(
+            invocation,
+            ModelProviderDiagnosticKindV1::ResponseTooLarge,
+            &response,
+        ));
     }
-    decode_http_response(&response, endpoint.max_response_bytes)
+    decode_http_response(&response, endpoint.max_response_bytes, invocation)
 }
 
-fn decode_http_response(response: &[u8], maximum: usize) -> Result<Vec<u8>, ()> {
+fn decode_http_response(
+    response: &[u8],
+    maximum: usize,
+    invocation: &protocol::ModelInvocationV1,
+) -> Result<Vec<u8>, ModelProviderDiagnosticReceiptV1> {
+    let malformed = || {
+        response_diagnostic(
+            invocation,
+            ModelProviderDiagnosticKindV1::MalformedHttp,
+            response,
+        )
+    };
     let separator = response
         .windows(4)
         .position(|value| value == b"\r\n\r\n")
-        .ok_or(())?;
-    let head = std::str::from_utf8(&response[..separator]).map_err(|_| ())?;
+        .ok_or_else(malformed)?;
+    let head = std::str::from_utf8(&response[..separator]).map_err(|_| malformed())?;
     let mut lines = head.split("\r\n");
-    let status = lines.next().ok_or(())?;
+    let status = lines.next().ok_or_else(malformed)?;
     let mut status_fields = status.split_ascii_whitespace();
-    if status_fields.next() != Some("HTTP/1.1")
-        || status_fields
-            .next()
-            .and_then(|value| value.parse::<u16>().ok())
-            != Some(200)
-    {
-        return Err(());
+    if status_fields.next() != Some("HTTP/1.1") {
+        return Err(malformed());
+    }
+    let status = status_fields
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(malformed)?;
+    if status != 200 {
+        return Err(response_diagnostic(
+            invocation,
+            ModelProviderDiagnosticKindV1::HttpStatus(status),
+            response,
+        ));
     }
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
-        let (name, value) = line.split_once(':').ok_or(())?;
+        let (name, value) = line.split_once(':').ok_or_else(malformed)?;
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
             if content_length
-                .replace(value.parse::<usize>().map_err(|_| ())?)
+                .replace(value.parse::<usize>().map_err(|_| malformed())?)
                 .is_some()
             {
-                return Err(());
+                return Err(malformed());
             }
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             chunked = value.eq_ignore_ascii_case("chunked");
             if !chunked {
-                return Err(());
+                return Err(malformed());
             }
         }
     }
     let body = &response[separator + 4..];
     if chunked {
-        decode_chunks(body, maximum)
+        decode_chunks(body, maximum).map_err(|_| malformed())
     } else if let Some(length) = content_length {
         if length > maximum || body.len() != length {
-            return Err(());
+            return Err(malformed());
         }
         Ok(body.to_vec())
     } else if body.len() <= maximum {
         Ok(body.to_vec())
     } else {
-        Err(())
+        Err(response_diagnostic(
+            invocation,
+            ModelProviderDiagnosticKindV1::ResponseTooLarge,
+            response,
+        ))
     }
 }
 

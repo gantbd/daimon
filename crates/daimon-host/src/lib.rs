@@ -4,9 +4,9 @@ pub mod agent;
 pub mod presence;
 
 use daimon_protocol::{
-    ArtifactReferenceIdV1, ContextEvidenceV1, ExecuteRequestV1, ExecutionDispositionV1,
-    ExecutionIdV1, ModelInvocationV1, ModelMessageV1, ModelProviderReceiptV1,
-    ProviderProfileSnapshotV1, ToolCapabilityIdV1,
+    ArtifactReferenceIdV1, ContentDigestV1, ContextEvidenceV1, ExecuteRequestV1,
+    ExecutionDispositionV1, ExecutionIdV1, ModelInvocationV1, ModelMessageV1,
+    ModelProviderReceiptV1, ProviderProfileSnapshotV1, ToolCapabilityIdV1,
 };
 
 #[derive(Clone, Eq, PartialEq)]
@@ -126,9 +126,49 @@ pub enum ModelProviderOutcomeV1 {
     OutcomeUnknown,
 }
 
+/// Content-free operator evidence for one provider-side unknown outcome.
+///
+/// This receipt is diagnostic only: it is not a refusal, completion receipt,
+/// retry grant, or proof that the provider did not execute the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelProviderDiagnosticReceiptV1 {
+    pub execution_id: ExecutionIdV1,
+    pub provider_document_digest: ContentDigestV1,
+    pub kind: ModelProviderDiagnosticKindV1,
+    /// Digest of the complete bounded HTTP response when one was received.
+    /// Response bytes, headers, credentials, and model content are not exposed.
+    pub response_digest: Option<ContentDigestV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelProviderDiagnosticKindV1 {
+    UnknownProfile,
+    RequestConstruction,
+    Connect,
+    Transport,
+    ResponseTooLarge,
+    HttpStatus(u16),
+    MalformedHttp,
+    InvalidJson,
+    MissingUsage,
+    MissingChoice,
+    EmptyResponse,
+    InvalidStructuredOutput,
+    InvalidToolCall,
+}
+
 /// One terminal provider admission. Implementations must not retry implicitly.
 pub trait ModelProvider {
     fn execute_model(&mut self, invocation: &ModelInvocationV1) -> ModelProviderOutcomeV1;
+
+    /// Returns content-free evidence for the named execution when the adapter
+    /// retained a diagnostic. Absence does not narrow an unknown outcome.
+    fn diagnostic_receipt(
+        &self,
+        _execution_id: ExecutionIdV1,
+    ) -> Option<ModelProviderDiagnosticReceiptV1> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

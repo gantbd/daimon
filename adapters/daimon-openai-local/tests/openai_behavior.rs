@@ -1,4 +1,4 @@
-use daimon_host::{ModelProvider, ModelProviderOutcomeV1};
+use daimon_host::{ModelProvider, ModelProviderDiagnosticKindV1, ModelProviderOutcomeV1};
 use daimon_openai_local::{
     EndpointV1, LocalProfileV1, OpenAiCompatibleProvider, ResponseModeV1, StaticProfileResolver,
     evidence_digest, profile_document_digest,
@@ -98,6 +98,13 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 fn server(response_body: Vec<u8>) -> (std::net::SocketAddr, mpsc::Receiver<Vec<u8>>) {
+    server_with_status("200 OK", response_body)
+}
+
+fn server_with_status(
+    status: &'static str,
+    response_body: Vec<u8>,
+) -> (std::net::SocketAddr, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (send, receive) = mpsc::channel();
@@ -105,7 +112,7 @@ fn server(response_body: Vec<u8>) -> (std::net::SocketAddr, mpsc::Receiver<Vec<u
         let (mut stream, _) = listener.accept().unwrap();
         send.send(read_request(&mut stream)).unwrap();
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             response_body.len()
         );
         stream.write_all(header.as_bytes()).unwrap();
@@ -408,6 +415,44 @@ fn missing_usage_is_outcome_unknown_instead_of_unbudgeted_success() {
         provider.execute_model(&invocation),
         ModelProviderOutcomeV1::OutcomeUnknown
     );
+    let diagnostic = provider
+        .diagnostic_receipt(invocation.execution_id)
+        .expect("missing usage retains a content-free diagnostic");
+    assert_eq!(diagnostic.execution_id, invocation.execution_id);
+    assert_eq!(
+        diagnostic.provider_document_digest,
+        invocation.provider.document_digest
+    );
+    assert_eq!(diagnostic.kind, ModelProviderDiagnosticKindV1::MissingUsage);
+    assert!(diagnostic.response_digest.is_some());
+}
+
+#[test]
+fn non_success_http_status_retains_only_status_and_response_digest() {
+    let body = br#"{"error":"schema feature unsupported","secret":"must not escape"}"#.to_vec();
+    let (address, request) = server_with_status("400 Bad Request", body);
+    let profile = profile(address, ResponseModeV1::DaimonJsonSchema);
+    let invocation = invocation(profile.snapshot.clone());
+    let mut provider = OpenAiCompatibleProvider::try_new(&[profile]).unwrap();
+
+    assert_eq!(
+        provider.execute_model(&invocation),
+        ModelProviderOutcomeV1::OutcomeUnknown
+    );
+    let diagnostic = provider
+        .diagnostic_receipt(invocation.execution_id)
+        .expect("HTTP failure retains a content-free diagnostic");
+    assert_eq!(
+        diagnostic.kind,
+        ModelProviderDiagnosticKindV1::HttpStatus(400)
+    );
+    assert!(diagnostic.response_digest.is_some());
+    let debug = format!("{diagnostic:?}");
+    assert!(!debug.contains("schema feature unsupported"));
+    assert!(!debug.contains("must not escape"));
+
+    let sent = String::from_utf8(request.recv().unwrap()).unwrap();
+    assert_eq!(sent.matches("POST ").count(), 1, "adapter must not retry");
 }
 
 #[test]

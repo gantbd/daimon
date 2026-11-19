@@ -14,7 +14,7 @@ use daimon_dendrite::{
 };
 use daimon_host::{
     AssembledModelInputV1, AuthenticatedSessionV1, ContextAssembler, ContextRefusalV1,
-    ModelProvider, ModelProviderOutcomeV1,
+    ModelProvider, ModelProviderDiagnosticKindV1, ModelProviderOutcomeV1,
 };
 use daimon_local_daemon::unix::{Authenticator, ModelDaemon};
 use daimon_openai_local::{
@@ -398,6 +398,10 @@ struct ProviderQualificationProjectionV1 {
     output_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic_response_digest: Option<String>,
     known_deviations: Vec<String>,
     replayed: bool,
 }
@@ -1263,6 +1267,16 @@ pub fn qualify_provider_json(
             record
                 .known_deviations
                 .push("provider outcome requires operator reconciliation".into());
+            if let Some(diagnostic) = provider.diagnostic_receipt(invocation.execution_id) {
+                record.diagnostic_kind = Some(diagnostic_kind(diagnostic.kind));
+                record.diagnostic_response_digest = diagnostic
+                    .response_digest
+                    .map(|digest| digest_text(digest.into_bytes()));
+                record.known_deviations.push(
+                    "provider diagnostic is content-free and does not narrow outcome uncertainty"
+                        .into(),
+                );
+            }
         }
     }
     write_qualification_atomic(&record_path, &record)?;
@@ -1313,8 +1327,30 @@ fn qualification_record(
         output_tokens: 0,
         output_bytes: 0,
         evidence_digest: None,
+        diagnostic_kind: None,
+        diagnostic_response_digest: None,
         known_deviations: vec!["tool_continuation_not_exercised".into()],
         replayed: false,
+    }
+}
+
+fn diagnostic_kind(kind: ModelProviderDiagnosticKindV1) -> String {
+    match kind {
+        ModelProviderDiagnosticKindV1::UnknownProfile => "unknown_profile".into(),
+        ModelProviderDiagnosticKindV1::RequestConstruction => "request_construction".into(),
+        ModelProviderDiagnosticKindV1::Connect => "connect".into(),
+        ModelProviderDiagnosticKindV1::Transport => "transport".into(),
+        ModelProviderDiagnosticKindV1::ResponseTooLarge => "response_too_large".into(),
+        ModelProviderDiagnosticKindV1::HttpStatus(status) => format!("http_status:{status}"),
+        ModelProviderDiagnosticKindV1::MalformedHttp => "malformed_http".into(),
+        ModelProviderDiagnosticKindV1::InvalidJson => "invalid_json".into(),
+        ModelProviderDiagnosticKindV1::MissingUsage => "missing_usage".into(),
+        ModelProviderDiagnosticKindV1::MissingChoice => "missing_choice".into(),
+        ModelProviderDiagnosticKindV1::EmptyResponse => "empty_response".into(),
+        ModelProviderDiagnosticKindV1::InvalidStructuredOutput => {
+            "invalid_structured_output".into()
+        }
+        ModelProviderDiagnosticKindV1::InvalidToolCall => "invalid_tool_call".into(),
     }
 }
 
