@@ -84,6 +84,7 @@ governed scope:
   "commands": [{
     "command": "core-unit-tests",
     "capability": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+    "semantic_capability": "verification.test.run.v1",
     "program": "/absolute/path/to/cargo",
     "argument_prefix": ["test", "--package", "core", "--locked", "--offline"],
     "allow_additional_arguments": false
@@ -97,7 +98,9 @@ governed scope:
 The scope capability is a compatibility default. A command-specific
 `capability` overrides it, must independently appear in `tool_capabilities`,
 and is rechecked against both the exact turn execution and the live Aegis grant
-before that command can start. This allows a single workspace terminal catalog
+before that command can start. Its required `semantic_capability` is the stable
+component-owned identity shown in the redacted provider catalogue; aggregate
+`pantheon` names and wildcards are refused. This allows a single workspace terminal catalog
 to expose independently authorized Pantheon and bounded-web gateways without
 granting either merely because the other is present. A governed test catalog
 uses an operator-facing command name and sets

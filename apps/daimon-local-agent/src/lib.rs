@@ -174,6 +174,10 @@ pub struct AcpTerminalCommandConfigV1 {
     /// terminal-scope capability remains the compatibility default.
     #[serde(default)]
     pub capability: Option<String>,
+    /// Stable component-owned capability identifier disclosed in the redacted
+    /// catalogue. Required whenever `capability` overrides the scope default.
+    #[serde(default)]
+    pub semantic_capability: Option<String>,
     pub program: PathBuf,
     #[serde(default)]
     pub argument_prefix: Vec<String>,
@@ -274,6 +278,16 @@ struct ProviderCatalogV1<'a> {
     providers: Vec<ProviderCatalogEntryV1<'a>>,
     task_bindings: Vec<TaskBindingCatalogEntryV1<'a>>,
     contexts: Vec<ContextCatalogEntryV1<'a>>,
+    tools: Vec<ToolCatalogEntryV1>,
+}
+
+#[derive(Serialize)]
+struct ToolCatalogEntryV1 {
+    workspace: String,
+    transport: &'static str,
+    command: String,
+    tool_id: String,
+    semantic_capability: String,
 }
 
 #[derive(Serialize)]
@@ -388,6 +402,7 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
                 }),
         )
         .collect();
+    let tools = tool_catalog(&validated);
     serde_json::to_string(&ProviderCatalogV1 {
         version: 1,
         owner: "daimon-local-agent",
@@ -395,13 +410,44 @@ pub fn provider_catalog_json(path: impl AsRef<Path>) -> Result<String, ConfigErr
         providers,
         task_bindings,
         contexts,
+        tools,
     })
     .map_err(|_| ConfigErrorV1::Json)
+}
+
+fn tool_catalog(validated: &ValidatedConfigV1) -> Vec<ToolCatalogEntryV1> {
+    validated
+        .terminal_scopes
+        .iter()
+        .flat_map(|scope| {
+            scope.commands.iter().filter_map(move |(command, entry)| {
+                entry
+                    .semantic_capability
+                    .as_ref()
+                    .map(|semantic_capability| ToolCatalogEntryV1 {
+                        workspace: id_text(scope.workspace),
+                        transport: "acp_terminal",
+                        command: command.clone(),
+                        tool_id: id_text(entry.capability.into_bytes()),
+                        semantic_capability: semantic_capability.clone(),
+                    })
+            })
+        })
+        .collect()
 }
 
 fn digest_text(bytes: [u8; 32]) -> String {
     let mut text = String::with_capacity(71);
     text.push_str("sha256:");
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn id_text(bytes: [u8; 16]) -> String {
+    let mut text = String::with_capacity(32);
     for byte in bytes {
         use std::fmt::Write;
         let _ = write!(text, "{byte:02x}");
@@ -790,6 +836,7 @@ struct AgentTerminalScopeV1 {
 #[derive(Clone)]
 struct AgentTerminalCommandV1 {
     capability: protocol::ToolCapabilityIdV1,
+    semantic_capability: Option<String>,
     program: PathBuf,
     argument_prefix: Vec<String>,
     allow_additional_arguments: bool,
@@ -984,6 +1031,14 @@ fn validate_terminal_scopes(
             {
                 return Err(ConfigErrorV1::Invalid);
             }
+            if command.capability.is_some() != command.semantic_capability.is_some()
+                || command
+                    .semantic_capability
+                    .as_deref()
+                    .is_some_and(|value| !valid_semantic_capability(value))
+            {
+                return Err(ConfigErrorV1::Invalid);
+            }
             let command_capability = command
                 .capability
                 .as_deref()
@@ -1000,6 +1055,7 @@ fn validate_terminal_scopes(
                         command.command.clone(),
                         AgentTerminalCommandV1 {
                             capability: protocol::ToolCapabilityIdV1::new(command_capability),
+                            semantic_capability: command.semantic_capability.clone(),
                             program,
                             argument_prefix: command.argument_prefix.clone(),
                             allow_additional_arguments: command.allow_additional_arguments,
@@ -1029,6 +1085,31 @@ fn valid_relative_scope(path: &Path) -> bool {
             && path
                 .components()
                 .all(|component| matches!(component, Component::Normal(_))))
+}
+
+fn valid_semantic_capability(value: &str) -> bool {
+    if !(5..=128).contains(&value.len())
+        || value.starts_with("pantheon")
+        || value.contains("..")
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-')
+        })
+    {
+        return false;
+    }
+    let mut parts = value.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let remaining = parts.collect::<Vec<_>>();
+    !first.is_empty()
+        && remaining.len() >= 2
+        && remaining.iter().all(|part| !part.is_empty())
+        && remaining.last().is_some_and(|version| {
+            version.strip_prefix('v').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
 }
 
 struct SharedAuthorizer<A>(Rc<RefCell<A>>);
@@ -2585,6 +2666,7 @@ mod tests {
             commands: vec![AcpTerminalCommandConfigV1 {
                 command: "echo".to_owned(),
                 capability: None,
+                semantic_capability: None,
                 program: PathBuf::from("/bin/echo"),
                 argument_prefix: vec!["approved".to_owned()],
                 allow_additional_arguments: false,
@@ -2604,12 +2686,28 @@ mod tests {
         let command_capability = "75757575757575757575757575757575".to_owned();
         value.workspaces[0].acp_terminal.as_mut().unwrap().commands[0].capability =
             Some(command_capability.clone());
+        value.workspaces[0].acp_terminal.as_mut().unwrap().commands[0].semantic_capability =
+            Some("agent.web.fetch.v1".to_owned());
         assert!(matches!(
             validate(value.clone()),
             Err(ConfigErrorV1::Invalid)
         ));
         value.tool_capabilities.push(command_capability);
-        assert!(validate(value.clone()).is_ok());
+        let validated = validate(value.clone()).unwrap();
+        let catalog = tool_catalog(&validated);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].command, "echo");
+        assert_eq!(catalog[0].semantic_capability, "agent.web.fetch.v1");
+        assert_eq!(catalog[0].tool_id, "75".repeat(16));
+
+        value.workspaces[0].acp_terminal.as_mut().unwrap().commands[0].semantic_capability =
+            Some("pantheon.*".to_owned());
+        assert!(matches!(
+            validate(value.clone()),
+            Err(ConfigErrorV1::Invalid)
+        ));
+        value.workspaces[0].acp_terminal.as_mut().unwrap().commands[0].semantic_capability =
+            Some("agent.web.fetch.v1".to_owned());
 
         value.workspaces[0]
             .acp_terminal
@@ -2619,6 +2717,7 @@ mod tests {
             .push(AcpTerminalCommandConfigV1 {
                 command: "echo".to_owned(),
                 capability: None,
+                semantic_capability: None,
                 program: PathBuf::from("/bin/echo"),
                 argument_prefix: Vec::new(),
                 allow_additional_arguments: true,
@@ -2630,6 +2729,7 @@ mod tests {
     fn exact_terminal_catalog_entry_refuses_model_supplied_suffixes() {
         let exact = AgentTerminalCommandV1 {
             capability: protocol::ToolCapabilityIdV1::new([74; 16]),
+            semantic_capability: None,
             program: PathBuf::from("/bin/echo"),
             argument_prefix: vec!["test".to_owned(), "--package".to_owned(), "core".to_owned()],
             allow_additional_arguments: false,
@@ -2679,6 +2779,7 @@ mod tests {
             "sh".to_owned(),
             AgentTerminalCommandV1 {
                 capability: protocol::ToolCapabilityIdV1::new([75; 16]),
+                semantic_capability: None,
                 program,
                 argument_prefix: Vec::new(),
                 allow_additional_arguments: true,
