@@ -1,8 +1,8 @@
 use daimon_client::{AgentReadOnlyClient, AgentServicePort, AgentSessionClient};
 use daimon_protocol::agent::{
     AgentCapabilitiesV1, AgentCommandV1, AgentEventPageV1, AgentOpenRequestV1, AgentOutcomeV1,
-    AgentPermissionDecisionV1, AgentReplyV1, AgentSessionBudgetV1, AgentSessionPhaseV1,
-    AgentSessionViewV1, AgentTurnRequestV1,
+    AgentPermissionDecisionV1, AgentReplyV1, AgentResultBindingV1, AgentSessionBudgetV1,
+    AgentSessionPhaseV1, AgentSessionViewV1, AgentTurnRequestV1, AgentTurnStopReasonV1,
 };
 use daimon_protocol::{
     AgentPermissionOptionIdV1, AgentPermissionRequestIdV1, AgentSessionIdV1, AgentTurnIdV1,
@@ -33,6 +33,31 @@ impl AgentServicePort for Port {
                     session,
                     entries: Vec::new(),
                     next_after: None,
+                }))
+            }
+            AgentCommandV1::Result { turn, .. } => {
+                AgentReplyV1::Accepted(AgentOutcomeV1::Result(AgentResultBindingV1 {
+                    session,
+                    turn,
+                    execution: ExecutionIdV1::new([10; 16]),
+                    task_attempt: TaskAttemptRefV1 {
+                        task_key: [10; 16],
+                        task_incarnation: 1,
+                        attempt_number: 1,
+                    },
+                    principal: PrincipalIdV1::new([3; 16]),
+                    profile: HarnessProfileIdV1::new([4; 16]),
+                    operation: IdempotencyKeyV1::new([11; 16]),
+                    authority_decision: [13; 16],
+                    authority_expires_at: 100,
+                    prompt_digest: ContentDigestV1::new([12; 32]),
+                    context_manifest_digest: ContentDigestV1::new([14; 32]),
+                    event_start_cursor: 1,
+                    terminal_cursor: 2,
+                    terminal_revision: 2,
+                    disposition: daimon_protocol::ExecutionDispositionV1::Completed,
+                    stop_reason: AgentTurnStopReasonV1::EndTurn,
+                    output_digest: Some(ContentDigestV1::new([15; 32])),
                 }))
             }
             _ => AgentReplyV1::Accepted(AgentOutcomeV1::Session(AgentSessionViewV1 {
@@ -190,7 +215,7 @@ fn mutation_facade_preserves_exact_revision_identity_and_decision() {
 }
 
 #[test]
-fn read_only_facade_exposes_views_and_cursor_pages_without_mutation_commands() {
+fn read_only_facade_exposes_views_pages_and_owner_result_bindings_without_mutation_commands() {
     let commands = Rc::new(RefCell::new(Vec::new()));
     let mut client = AgentReadOnlyClient::new(SessionHandleV1(17), port(&commands));
     let session = AgentSessionIdV1::new([1; 16]);
@@ -202,6 +227,10 @@ fn read_only_facade_exposes_views_and_cursor_pages_without_mutation_commands() {
             .entries
             .is_empty()
     );
+    let turn = AgentTurnIdV1::new([8; 16]);
+    let binding = client.result_binding(session, turn).unwrap();
+    assert_eq!(binding.turn, turn);
+    assert_eq!(binding.task_attempt.task_key, [10; 16]);
 
     let captured = commands.borrow();
     assert!(matches!(captured[0].1, AgentCommandV1::Inspect { .. }));
@@ -212,6 +241,10 @@ fn read_only_facade_exposes_views_and_cursor_pages_without_mutation_commands() {
             limit: 16,
             ..
         }
+    ));
+    assert!(matches!(
+        captured[2].1,
+        AgentCommandV1::Result { turn, .. } if turn == AgentTurnIdV1::new([8; 16])
     ));
 }
 

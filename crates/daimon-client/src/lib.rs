@@ -5,7 +5,8 @@ pub mod unix;
 
 use daimon_protocol::agent::{
     AgentCommandV1, AgentEventPageV1, AgentOpenRequestV1, AgentOutcomeV1,
-    AgentPermissionDecisionV1, AgentReplyV1, AgentSessionViewV1, AgentTurnRequestV1,
+    AgentPermissionDecisionV1, AgentReplyV1, AgentResultBindingV1, AgentSessionViewV1,
+    AgentTurnRequestV1,
 };
 use daimon_protocol::{AgentSessionIdV1, AgentTurnIdV1, IdempotencyKeyV1};
 use daimon_protocol::{
@@ -214,6 +215,17 @@ impl<P: AgentServicePort> AgentReadOnlyClient<P> {
         )
     }
 
+    pub fn result(
+        &mut self,
+        session: AgentSessionIdV1,
+        turn: AgentTurnIdV1,
+    ) -> Result<AgentReplyV1, P::Error> {
+        self.port.execute_agent(
+            self.service_session,
+            AgentCommandV1::Result { session, turn },
+        )
+    }
+
     pub fn current_view(&mut self, session: AgentSessionIdV1) -> Option<AgentSessionViewV1> {
         match self.inspect(session) {
             Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Session(view))) => Some(view),
@@ -229,6 +241,17 @@ impl<P: AgentServicePort> AgentReadOnlyClient<P> {
     ) -> Option<AgentEventPageV1> {
         match self.events(session, after, limit) {
             Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Events(page))) => Some(page),
+            _ => None,
+        }
+    }
+
+    pub fn result_binding(
+        &mut self,
+        session: AgentSessionIdV1,
+        turn: AgentTurnIdV1,
+    ) -> Option<AgentResultBindingV1> {
+        match self.result(session, turn) {
+            Ok(AgentReplyV1::Accepted(AgentOutcomeV1::Result(binding))) => Some(binding),
             _ => None,
         }
     }

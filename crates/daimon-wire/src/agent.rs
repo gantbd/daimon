@@ -306,6 +306,11 @@ fn encode_command(
             writer.byte(4)?;
             writer.id(session.into_bytes())
         }
+        AgentCommandV1::Result { session, turn } => {
+            writer.byte(10)?;
+            writer.id(session.into_bytes())?;
+            writer.id(turn.into_bytes())
+        }
         AgentCommandV1::Reattach {
             session,
             expected_revision,
@@ -477,6 +482,10 @@ fn decode_command(reader: &mut Reader<'_>) -> Result<AgentCommandV1, AgentWireCo
                 now,
             }
         }
+        10 => AgentCommandV1::Result {
+            session: AgentSessionIdV1::new(reader.id()?),
+            turn: AgentTurnIdV1::new(reader.id()?),
+        },
         _ => return Err(AgentWireCodecErrorV1::Malformed),
     })
 }
@@ -617,6 +626,31 @@ fn encode_outcome(
             }
             encode_optional_u64(writer, page.next_after)
         }
+        AgentOutcomeV1::Result(binding) => {
+            writer.byte(4)?;
+            writer.id(binding.session.into_bytes())?;
+            writer.id(binding.turn.into_bytes())?;
+            writer.id(binding.execution.into_bytes())?;
+            writer.id(binding.task_attempt.task_key)?;
+            writer.u64(binding.task_attempt.task_incarnation)?;
+            writer.u64(u64::from(binding.task_attempt.attempt_number))?;
+            writer.id(binding.principal.into_bytes())?;
+            writer.id(binding.profile.into_bytes())?;
+            writer.id(binding.operation.into_bytes())?;
+            writer.id(binding.authority_decision)?;
+            writer.u64(binding.authority_expires_at)?;
+            writer.digest(binding.prompt_digest.into_bytes())?;
+            writer.digest(binding.context_manifest_digest.into_bytes())?;
+            writer.u64(binding.event_start_cursor)?;
+            writer.u64(binding.terminal_cursor)?;
+            writer.u64(binding.terminal_revision)?;
+            writer.byte(disposition_tag(binding.disposition))?;
+            writer.byte(stop_reason_tag(binding.stop_reason))?;
+            encode_optional_digest(
+                writer,
+                binding.output_digest.map(ContentDigestV1::into_bytes),
+            )
+        }
         AgentOutcomeV1::OutcomeUnknown {
             session,
             idempotency_key,
@@ -654,6 +688,30 @@ fn decode_outcome(reader: &mut Reader<'_>) -> Result<AgentOutcomeV1, AgentWireCo
             session: AgentSessionIdV1::new(reader.id()?),
             idempotency_key: IdempotencyKeyV1::new(reader.id()?),
         },
+        4 => AgentOutcomeV1::Result(AgentResultBindingV1 {
+            session: AgentSessionIdV1::new(reader.id()?),
+            turn: AgentTurnIdV1::new(reader.id()?),
+            execution: ExecutionIdV1::new(reader.id()?),
+            task_attempt: TaskAttemptRefV1 {
+                task_key: reader.id()?,
+                task_incarnation: reader.u64()?,
+                attempt_number: u32::try_from(reader.u64()?)
+                    .map_err(|_| AgentWireCodecErrorV1::Limit)?,
+            },
+            principal: PrincipalIdV1::new(reader.id()?),
+            profile: HarnessProfileIdV1::new(reader.id()?),
+            operation: IdempotencyKeyV1::new(reader.id()?),
+            authority_decision: reader.id()?,
+            authority_expires_at: reader.u64()?,
+            prompt_digest: ContentDigestV1::new(reader.digest()?),
+            context_manifest_digest: ContentDigestV1::new(reader.digest()?),
+            event_start_cursor: reader.u64()?,
+            terminal_cursor: reader.u64()?,
+            terminal_revision: reader.u64()?,
+            disposition: decode_disposition(reader.byte()?)?,
+            stop_reason: decode_stop_reason(reader.byte()?)?,
+            output_digest: decode_optional_digest(reader)?.map(ContentDigestV1::new),
+        }),
         _ => return Err(AgentWireCodecErrorV1::Malformed),
     })
 }

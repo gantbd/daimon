@@ -256,6 +256,31 @@ pub struct AgentEventPageV1 {
     pub next_after: Option<u64>,
 }
 
+/// Daimon-owned, content-free binding from one uniquely retained prompt turn
+/// to its exact execution/task attempt and terminal event interval. This is an
+/// observation receipt only: it grants no publication, task mutation,
+/// acceptance, retry, or rollout authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentResultBindingV1 {
+    pub session: AgentSessionIdV1,
+    pub turn: AgentTurnIdV1,
+    pub execution: ExecutionIdV1,
+    pub task_attempt: super::TaskAttemptRefV1,
+    pub principal: super::PrincipalIdV1,
+    pub profile: HarnessProfileIdV1,
+    pub operation: IdempotencyKeyV1,
+    pub authority_decision: [u8; 16],
+    pub authority_expires_at: u64,
+    pub prompt_digest: ContentDigestV1,
+    pub context_manifest_digest: ContentDigestV1,
+    pub event_start_cursor: u64,
+    pub terminal_cursor: u64,
+    pub terminal_revision: u64,
+    pub disposition: ExecutionDispositionV1,
+    pub stop_reason: AgentTurnStopReasonV1,
+    pub output_digest: Option<ContentDigestV1>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentCommandV1 {
     Open {
@@ -273,6 +298,10 @@ pub enum AgentCommandV1 {
     },
     Inspect {
         session: AgentSessionIdV1,
+    },
+    Result {
+        session: AgentSessionIdV1,
+        turn: AgentTurnIdV1,
     },
     /// Re-establishes an idle retained provider binding without replaying
     /// conversation history or submitting another prompt.
@@ -319,6 +348,7 @@ pub enum AgentCommandV1 {
 pub enum AgentOutcomeV1 {
     Session(AgentSessionViewV1),
     Events(AgentEventPageV1),
+    Result(AgentResultBindingV1),
     OutcomeUnknown {
         session: AgentSessionIdV1,
         idempotency_key: IdempotencyKeyV1,

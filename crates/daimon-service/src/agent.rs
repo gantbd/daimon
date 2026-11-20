@@ -19,7 +19,8 @@ use daimon_protocol as protocol;
 use daimon_protocol::agent::{
     AgentCommandV1, AgentContextManifestEntryV1, AgentContextReceiptV1, AgentEventPageV1,
     AgentEventRecordV1, AgentEventV1, AgentOpenRequestV1, AgentOutcomeV1, AgentProfileSnapshotV1,
-    AgentRefusalV1, AgentReplyV1, AgentSessionPhaseV1, AgentSessionViewV1, AgentTurnRequestV1,
+    AgentRefusalV1, AgentReplyV1, AgentResultBindingV1, AgentSessionPhaseV1, AgentSessionViewV1,
+    AgentTurnRequestV1,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -278,6 +279,7 @@ where
                 limit,
             } => self.events(&facts, session, after, limit),
             AgentCommandV1::Inspect { session } => self.inspect(&facts, session),
+            AgentCommandV1::Result { session, turn } => self.result(&facts, session, turn),
             AgentCommandV1::Reattach {
                 session,
                 expected_revision,
@@ -460,6 +462,14 @@ where
                 }
                 OperationState::Completed(view) => accepted(AgentOutcomeV1::Session(view)),
             };
+        }
+        if entry.operations.values().any(|operation| {
+            matches!(
+                &operation.input,
+                OperationInput::Prompt(existing) if existing.turn == request.turn
+            )
+        }) {
+            return refused(AgentRefusalV1::TurnConflict);
         }
         if request.expected_revision != entry.revision {
             return refused(AgentRefusalV1::RevisionConflict);
@@ -1073,6 +1083,118 @@ where
             session,
             entries,
             next_after,
+        }))
+    }
+
+    fn result(
+        &self,
+        facts: &AuthenticatedSessionV1,
+        session: protocol::AgentSessionIdV1,
+        turn: protocol::AgentTurnIdV1,
+    ) -> AgentReplyV1 {
+        let Some(entry) = self.agent_sessions.get(&session) else {
+            return refused(AgentRefusalV1::UnknownAgentSession);
+        };
+        if entry.request.execution.principal.into_bytes() != facts.principal {
+            return refused(AgentRefusalV1::PrincipalMismatch);
+        }
+
+        let mut prompts = entry.operations.iter().filter_map(|(operation, value)| {
+            let OperationInput::Prompt(request) = &value.input else {
+                return None;
+            };
+            (request.turn == turn).then_some((*operation, value, request))
+        });
+        let Some((operation, prompt, request)) = prompts.next() else {
+            return refused(AgentRefusalV1::UnknownTurn);
+        };
+        if prompts.next().is_some() {
+            return refused(AgentRefusalV1::TurnConflict);
+        }
+        if matches!(prompt.state, OperationState::OutcomeUnknown) {
+            return unknown(session, operation);
+        }
+
+        let mut terminals = entry
+            .events
+            .iter()
+            .filter_map(|record| match &record.event {
+                AgentEventV1::TurnFinished {
+                    turn: observed,
+                    disposition,
+                    stop_reason,
+                    output_digest,
+                } if *observed == turn => {
+                    Some((record.cursor, *disposition, *stop_reason, *output_digest))
+                }
+                _ => None,
+            });
+        let Some((terminal_cursor, disposition, stop_reason, output_digest)) = terminals.next()
+        else {
+            return refused(AgentRefusalV1::Busy);
+        };
+        if terminals.next().is_some() {
+            return refused(AgentRefusalV1::ProviderReceiptConflict);
+        }
+
+        let terminal_revision = entry
+            .operations
+            .values()
+            .filter_map(|operation| match &operation.state {
+                OperationState::Completed(view)
+                    if view.last_event_cursor == Some(terminal_cursor) =>
+                {
+                    Some(view.revision)
+                }
+                _ => None,
+            })
+            .min();
+        let Some(terminal_revision) = terminal_revision else {
+            return refused(AgentRefusalV1::ProviderReceiptMismatch);
+        };
+        let event_start_cursor = entry
+            .events
+            .iter()
+            .filter_map(|record| {
+                (record.cursor < terminal_cursor
+                    && matches!(&record.event, AgentEventV1::TurnFinished { .. }))
+                .then_some(record.cursor)
+            })
+            .max()
+            .map_or(0, |cursor| cursor.saturating_add(1));
+        let OperationState::Completed(prompt_view) = &prompt.state else {
+            unreachable!("outcome-unknown returned above")
+        };
+        let Some(context_manifest_digest) = prompt_view
+            .last_context
+            .as_ref()
+            .filter(|receipt| receipt.execution == request.execution.execution_id)
+            .map(|receipt| receipt.manifest_digest)
+        else {
+            return refused(AgentRefusalV1::ProviderReceiptMismatch);
+        };
+        let Some(preparation) = prompt.preparation.as_ref() else {
+            return refused(AgentRefusalV1::ProviderReceiptMismatch);
+        };
+
+        accepted(AgentOutcomeV1::Result(AgentResultBindingV1 {
+            session,
+            turn,
+            execution: request.execution.execution_id,
+            task_attempt: request.execution.task_attempt,
+            principal: request.execution.principal,
+            profile: request.execution.profile,
+            operation,
+            authority_decision: preparation.authority_decision,
+            authority_expires_at: preparation.authority_expires_at,
+            prompt_digest: request.prompt_digest,
+            context_manifest_digest,
+            event_start_cursor,
+            terminal_cursor,
+            terminal_revision,
+            disposition,
+            stop_reason,
+            output_digest,
         }))
     }
 

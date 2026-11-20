@@ -585,6 +585,106 @@ fn authorized_open_and_prompt_preserve_typed_events_and_replay_without_redispatc
 }
 
 #[test]
+fn completed_turn_exposes_exact_content_free_owner_binding() {
+    let (mut service, authorizations, attempts, invocations) = service();
+    let handle = service.open_service_session(facts()).unwrap();
+    service.execute(
+        handle,
+        AgentCommandV1::Open {
+            request: open_request(),
+            now: 10,
+        },
+    );
+    service.execute(
+        handle,
+        AgentCommandV1::Prompt {
+            request: turn_request(),
+            now: 11,
+        },
+    );
+
+    let reply = service.execute(
+        handle,
+        AgentCommandV1::Result {
+            session: open_request().session,
+            turn: turn_request().turn,
+        },
+    );
+    let AgentReplyV1::Accepted(AgentOutcomeV1::Result(binding)) = reply else {
+        panic!("owner result binding expected")
+    };
+    assert_eq!(binding.session, open_request().session);
+    assert_eq!(binding.turn, turn_request().turn);
+    assert_eq!(binding.execution, turn_request().execution.execution_id);
+    assert_eq!(binding.task_attempt, turn_request().execution.task_attempt);
+    assert_eq!(binding.principal, turn_request().execution.principal);
+    assert_eq!(binding.profile, turn_request().execution.profile);
+    assert_eq!(binding.operation, turn_request().execution.idempotency_key);
+    assert_eq!(binding.authority_decision, [13; 16]);
+    assert_eq!(binding.authority_expires_at, 100);
+    assert_eq!(binding.prompt_digest, turn_request().prompt_digest);
+    assert_ne!(binding.context_manifest_digest.into_bytes(), [0; 32]);
+    assert_eq!(binding.event_start_cursor, 0);
+    assert_eq!(binding.terminal_cursor, 1);
+    assert_eq!(binding.terminal_revision, 2);
+    assert_eq!(
+        binding.disposition,
+        protocol::ExecutionDispositionV1::Completed
+    );
+    assert_eq!(binding.stop_reason, AgentTurnStopReasonV1::EndTurn);
+    assert_eq!(
+        binding.output_digest,
+        Some(protocol::ContentDigestV1::new([18; 32]))
+    );
+
+    assert_eq!(invocations.borrow().len(), 2);
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(authorizations.get(), 2);
+}
+
+#[test]
+fn prompt_turn_identity_cannot_be_reused_under_a_fresh_operation() {
+    let (mut service, authorizations, attempts, invocations) = service();
+    let handle = service.open_service_session(facts()).unwrap();
+    service.execute(
+        handle,
+        AgentCommandV1::Open {
+            request: open_request(),
+            now: 10,
+        },
+    );
+    let first = turn_request();
+    assert!(matches!(
+        service.execute(
+            handle,
+            AgentCommandV1::Prompt {
+                request: first.clone(),
+                now: 11,
+            },
+        ),
+        AgentReplyV1::Accepted(AgentOutcomeV1::Session(_))
+    ));
+
+    let mut reused = first;
+    reused.expected_revision = 2;
+    reused.execution.execution_id = protocol::ExecutionIdV1::new([41; 16]);
+    reused.execution.idempotency_key = protocol::IdempotencyKeyV1::new([42; 16]);
+    assert_eq!(
+        service.execute(
+            handle,
+            AgentCommandV1::Prompt {
+                request: reused,
+                now: 12,
+            },
+        ),
+        AgentReplyV1::Refused(protocol::agent::AgentRefusalV1::TurnConflict)
+    );
+    assert_eq!(invocations.borrow().len(), 2);
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(authorizations.get(), 2);
+}
+
+#[test]
 fn malformed_prompt_digest_refuses_before_authority_attempt_or_provider() {
     let (mut service, authorizations, attempts, invocations) = service();
     let handle = service.open_service_session(facts()).unwrap();
@@ -821,6 +921,16 @@ fn active_turn_advances_in_bounded_replay_safe_slices() {
             request: request.clone(),
             now: 11,
         },
+    );
+    assert_eq!(
+        service.execute(
+            handle,
+            AgentCommandV1::Result {
+                session: request.session,
+                turn: request.turn,
+            },
+        ),
+        AgentReplyV1::Refused(protocol::agent::AgentRefusalV1::Busy)
     );
     let first = AgentCommandV1::Advance {
         session: request.session,
@@ -1277,6 +1387,19 @@ fn indeterminate_agent_result_commit_reopens_exact_result_without_redispatch() {
         })
     );
     assert_eq!(invocations.borrow().len(), 2);
+    assert_eq!(
+        first.execute(
+            handle,
+            AgentCommandV1::Result {
+                session: open_request().session,
+                turn: turn_request().turn,
+            },
+        ),
+        AgentReplyV1::Accepted(AgentOutcomeV1::OutcomeUnknown {
+            session: open_request().session,
+            idempotency_key: turn_request().execution.idempotency_key,
+        })
+    );
     drop(first);
 
     store.indeterminate_at.set(None);

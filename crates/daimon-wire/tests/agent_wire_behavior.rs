@@ -70,6 +70,7 @@ fn every_agent_command_roundtrips_canonically() {
             limit: 8,
         },
         AgentCommandV1::Inspect { session },
+        AgentCommandV1::Result { session, turn },
         AgentCommandV1::Reattach {
             session,
             expected_revision: 1,
@@ -201,6 +202,29 @@ fn typed_event_page_roundtrips_and_rejects_every_truncation_or_trailing_byte() {
 fn session_unknown_and_every_refusal_roundtrip() {
     let limits = AgentWireLimitsV1::default();
     let replies = [
+        AgentReplyV1::Accepted(AgentOutcomeV1::Result(AgentResultBindingV1 {
+            session: AgentSessionIdV1::new([8; 16]),
+            turn: AgentTurnIdV1::new([11; 16]),
+            execution: ExecutionIdV1::new([12; 16]),
+            task_attempt: TaskAttemptRefV1 {
+                task_key: [13; 16],
+                task_incarnation: 2,
+                attempt_number: 3,
+            },
+            principal: PrincipalIdV1::new([4; 16]),
+            profile: HarnessProfileIdV1::new([5; 16]),
+            operation: IdempotencyKeyV1::new([14; 16]),
+            authority_decision: [15; 16],
+            authority_expires_at: 100,
+            prompt_digest: ContentDigestV1::new([16; 32]),
+            context_manifest_digest: ContentDigestV1::new([17; 32]),
+            event_start_cursor: 4,
+            terminal_cursor: 9,
+            terminal_revision: 6,
+            disposition: ExecutionDispositionV1::Completed,
+            stop_reason: AgentTurnStopReasonV1::EndTurn,
+            output_digest: Some(ContentDigestV1::new([18; 32])),
+        })),
         AgentReplyV1::Accepted(AgentOutcomeV1::Session(AgentSessionViewV1 {
             session: AgentSessionIdV1::new([8; 16]),
             revision: 2,
